@@ -166,11 +166,11 @@ MONTH_MAP = {
 }
 
 
-def parse_linux_time(month: str, day: str, time_str: str, year: int = YEAR) -> str:
+def parse_linux_time(month, day, time_str, year: int = YEAR) -> str:
     """Return ISO-8601 string from Linux syslog fields."""
-    m = MONTH_MAP.get(month.strip(), 1)
-    d = int(day.strip())
-    h, mi, s = time_str.strip().split(':')
+    m = MONTH_MAP.get(str(month).strip(), 1)
+    d = int(str(day).strip())
+    h, mi, s = str(time_str).strip().split(':')
     return f'{year}-{m:02d}-{d:02d}T{int(h):02d}:{int(mi):02d}:{int(s):02d}'
 
 
