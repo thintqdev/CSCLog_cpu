@@ -29,8 +29,9 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from src.model import CSCLog
 
-# ── Always CPU ────────────────────────────────────────────────────────────────
-DEVICE = torch.device('cpu')
+# ── Device: GPU if available, else CPU ──────────────────────────────────────
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'[evaluate] Using device: {DEVICE}')
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 RESULT_DIR    = os.path.join(os.path.dirname(__file__), 'dataset', 'result')

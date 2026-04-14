@@ -48,8 +48,9 @@ def seed_everything(seed: int = 42):
 
 seed_everything(42)
 
-# ── Always CPU ────────────────────────────────────────────────────────────────
-DEVICE = torch.device('cpu')
+# ── Device: GPU if available, else CPU ──────────────────────────────────────
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'[train] Using device: {DEVICE}')
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 RESULT_DIR   = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
