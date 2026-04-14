@@ -1,0 +1,340 @@
+"""
+Step 3: Train CSCLog on the Linux dataset (CPU-only).
+
+Usage:
+    python src/train.py [--epochs N] [--batch_size B] [--window_size W]
+
+Inputs  (produced by preprocess.py):
+    dataset/result/train_normal.csv
+    dataset/result/test_normal.csv
+    dataset/result/test_anomaly.csv
+    dataset/result/Linux.log_templates.csv
+    dataset/result/Linux_sentences_emb.json
+    dataset/result/Linux_component.json
+
+Outputs:
+    dataset/result/csclog_best.pth   – best checkpoint (highest F1)
+"""
+
+import sys
+import os
+import json
+import argparse
+import random
+import collections
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+import dateutil.parser
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, PROJECT_ROOT)
+
+from src.model import CSCLog
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+
+def seed_everything(seed: int = 42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+seed_everything(42)
+
+# ── Always CPU ────────────────────────────────────────────────────────────────
+DEVICE = torch.device('cpu')
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+RESULT_DIR   = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
+TEMPLATES_CSV = os.path.join(RESULT_DIR, 'Linux.log_templates.csv')
+EMB_PATH      = os.path.join(RESULT_DIR, 'Linux_sentences_emb.json')
+COM_PATH      = os.path.join(RESULT_DIR, 'Linux_component.json')
+TRAIN_CSV     = os.path.join(RESULT_DIR, 'train_normal.csv')
+TEST_NOR_CSV  = os.path.join(RESULT_DIR, 'test_normal.csv')
+TEST_ANO_CSV  = os.path.join(RESULT_DIR, 'test_anomaly.csv')
+CKPT_PATH     = os.path.join(RESULT_DIR, 'csclog_best.pth')
+
+# ── Default hyper-params ──────────────────────────────────────────────────────
+DEFAULTS = dict(
+    window_size  = 9,
+    batch_size   = 16,
+    epochs       = 10,
+    lr           = 1e-3,
+    weight_decay = 1e-4,
+    drop         = 0.1,
+    hidden_size  = [64, 64, 64, 64, 64],   # ft, lstm, mlp, gcn, out
+    alpha        = 0.8,
+    pattern      = 1,
+    num_layers   = 2,
+    num_candidates = [1],
+    anomaly_rate = 1,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_ts(s: str):
+    return dateutil.parser.parse(s, yearfirst=True)
+
+
+def generate_train(train_path, templates_csv, emb_path, com_path, window_size):
+    """Return a TensorDataset for sliding-window next-event prediction."""
+    train_df  = pd.read_csv(train_path, engine='c', na_filter=False, memory_map=True)
+    temp_df   = pd.read_csv(templates_csv, index_col='EventId',
+                            engine='c', na_filter=False, memory_map=True)
+    mapping   = {idx: i for i, idx in enumerate(temp_df.index.unique())}
+    emb       = json.load(open(emb_path))
+    cop       = json.load(open(com_path))
+    num_keys  = len(mapping)
+
+    inputs, outputs = [], []
+    for _, row in train_df.iterrows():
+        seqs = eval(row['EventSequence'])
+        n = len(seqs)
+        inputs.extend([seqs[i:i + window_size] for i in range(n - window_size)])
+        outputs.extend([mapping[seqs[i + window_size][0]] for i in range(n - window_size)])
+
+    inp_enc, com_enc, quan_enc, time_enc = [], [], [], []
+    for events in inputs:
+        # quantity pattern
+        qp = [0] * num_keys
+        for ev, _, _ in events:
+            if ev in mapping:
+                qp[mapping[ev]] += 1
+        quan_enc.append(qp)
+
+        inp, com, tm = [], [], []
+        t0 = _parse_ts(events[0][2])
+        for ev, component, ts in events:
+            inp.append(emb.get(ev, [0.0] * len(list(emb.values())[0])))
+            com.append(cop.get(component, 0))
+            tm.append((_parse_ts(ts) - t0).seconds)
+        inp_enc.append(inp)
+        com_enc.append(com)
+        time_enc.append(tm)
+
+    dataset = TensorDataset(
+        torch.tensor(inp_enc,  dtype=torch.float),
+        torch.tensor(com_enc,  dtype=torch.long),
+        torch.tensor(quan_enc, dtype=torch.float),
+        torch.tensor(time_enc, dtype=torch.float),
+        torch.tensor(outputs,  dtype=torch.long),
+    )
+    emb_dim = len(list(emb.values())[0])
+    print(f'[train] Training sequences: {len(dataset)}, '
+          f'emb_dim={emb_dim}, num_keys={num_keys}, num_coms={len(cop)}')
+    return dataset, emb_dim, num_keys, len(cop)
+
+
+def generate_test(log_path, templates_csv, emb_path, com_path, window_size):
+    """Load test CSV as per-session lists (same format as main.ipynb)."""
+    df      = pd.read_csv(log_path, engine='c', na_filter=False, memory_map=True)
+    temp_df = pd.read_csv(templates_csv, index_col='EventId',
+                          engine='c', na_filter=False, memory_map=True)
+    mapping = {idx: i for i, idx in enumerate(temp_df.index.unique())}
+    emb     = json.load(open(emb_path))
+    cop     = json.load(open(com_path))
+    num_keys = len(mapping)
+    emb_dim  = len(list(emb.values())[0])
+
+    sessions = []
+    for _, row in df.iterrows():
+        seqs = eval(row['EventSequence'])
+        n = len(seqs)
+        if n <= window_size:
+            continue
+
+        inp, comp, quanp, timep, labels = [], [], [], [], []
+        for i in range(n - window_size):
+            window = seqs[i:i + window_size]
+            qp = [0] * num_keys
+            for ev, _, _ in window:
+                if ev in mapping:
+                    qp[mapping[ev]] += 1
+            quanp.append(qp)
+
+            seq, com_l, tm_l = [], [], []
+            t0 = _parse_ts(window[0][2])
+            for ev, component, ts in window:
+                seq.append(emb.get(ev, [0.0] * emb_dim))
+                com_l.append(cop.get(component, 0))
+                tm_l.append((_parse_ts(ts) - t0).seconds)
+            inp.append(seq)
+            comp.append(com_l)
+            timep.append(tm_l)
+            next_ev = seqs[i + window_size][0]
+            labels.append(mapping.get(next_ev, -1))
+
+        if inp:
+            sessions.append((inp, comp, quanp, timep, labels))
+
+    print(f'[train] Test sessions loaded: {len(sessions)} from {log_path}')
+    return sessions
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_topk(normal_sessions, anomaly_sessions, model, num_candidates_list,
+                  anomaly_rate=1):
+    """Per-session anomaly detection using top-K next-event prediction."""
+    model.eval()
+
+    def session_hit(sessions, k_list):
+        hits = {k: [] for k in k_list}
+        with torch.no_grad():
+            for seq, com, quan, timp, labels in sessions:
+                seq   = torch.tensor(seq,  dtype=torch.float)
+                com   = torch.tensor(com,  dtype=torch.long)
+                quan  = torch.tensor(quan, dtype=torch.float)
+                timp  = torch.tensor(timp, dtype=torch.float)
+                labels = torch.tensor(labels, dtype=torch.long)
+
+                out    = model(seq, com, quan, timp)
+                for k in k_list:
+                    topk   = torch.argsort(out, dim=1, descending=True)[:, :k]
+                    misses = (~torch.isin(labels.unsqueeze(1), topk)).sum().item()
+                    hits[k].append(1 if misses >= anomaly_rate else 0)
+        return hits
+
+    nor_hits = session_hit(normal_sessions, num_candidates_list)
+    ano_hits = session_hit(anomaly_sessions, num_candidates_list)
+
+    results = {}
+    for k in num_candidates_list:
+        preds  = nor_hits[k] + ano_hits[k]
+        labels = [0] * len(nor_hits[k]) + [1] * len(ano_hits[k])
+        acc = accuracy_score(labels, preds)
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            labels, preds, average='macro', zero_division=0)
+        results[k] = (acc, prec, rec, f1)
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train(args):
+    # ------------------------------------------------------------------
+    # Load data
+    # ------------------------------------------------------------------
+    train_dataset, emb_dim, num_keys, num_coms = generate_train(
+        TRAIN_CSV, TEMPLATES_CSV, EMB_PATH, COM_PATH, args.window_size)
+    dataloader = DataLoader(train_dataset, batch_size=args.batch_size,
+                            shuffle=True, pin_memory=False)
+
+    normal_sessions  = generate_test(TEST_NOR_CSV, TEMPLATES_CSV, EMB_PATH,
+                                     COM_PATH, args.window_size)
+    anomaly_sessions = generate_test(TEST_ANO_CSV, TEMPLATES_CSV, EMB_PATH,
+                                     COM_PATH, args.window_size)
+
+    # ------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------
+    model = CSCLog(
+        input_size  = emb_dim,
+        com_num     = num_coms,
+        hidden_size = args.hidden_size,
+        alpha       = args.alpha,
+        pattern     = args.pattern,
+        num_layers  = args.num_layers,
+        num_keys    = num_keys,
+        drop        = args.drop,
+    ).to(DEVICE)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f'[train] Model parameters: {total_params:,}')
+
+    optimizer = optim.Adam(model.parameters(), lr=args.lr,
+                           weight_decay=args.weight_decay)
+    criterion = nn.CrossEntropyLoss()
+
+    best_f1, best_epoch = 0.0, 0
+
+    # ------------------------------------------------------------------
+    # Epoch loop
+    # ------------------------------------------------------------------
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        train_losses = []
+        for step, (seq, com, quan, timp, label) in enumerate(dataloader):
+            seq   = seq.to(DEVICE)
+            com   = com.to(DEVICE)
+            quan  = quan.to(DEVICE)
+            timp  = timp.to(DEVICE)
+            label = label.to(DEVICE)
+
+            optimizer.zero_grad()
+            out  = model(seq, com, quan, timp)
+            loss = criterion(out, label)
+            loss.backward()
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        avg_loss = np.mean(train_losses)
+        print(f'Epoch [{epoch}/{args.epochs}]  loss={avg_loss:.4f}')
+
+        # Evaluate
+        res = evaluate_topk(normal_sessions, anomaly_sessions, model,
+                            args.num_candidates, args.anomaly_rate)
+        for k, (acc, prec, rec, f1) in res.items():
+            print(f'  TopK={k} | Acc={acc:.3f}  Prec={prec:.3f}  '
+                  f'Rec={rec:.3f}  F1={f1:.3f}')
+            if f1 >= best_f1:
+                best_f1 = f1
+                best_epoch = epoch
+                state = {
+                    'model':     model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'epoch':     epoch,
+                    'f1':        best_f1,
+                    'args':      vars(args),
+                    'emb_dim':   emb_dim,
+                    'num_keys':  num_keys,
+                    'num_coms':  num_coms,
+                }
+                torch.save(state, CKPT_PATH)
+                print(f'  [train] → New best F1={best_f1:.3f}, checkpoint saved.')
+
+    print(f'\n[train] Best epoch: {best_epoch}  Best F1: {best_f1:.3f}')
+    print(f'[train] Checkpoint: {CKPT_PATH}')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description='Train CSCLog (CPU)')
+    p.add_argument('--window_size',    type=int,   default=DEFAULTS['window_size'])
+    p.add_argument('--batch_size',     type=int,   default=DEFAULTS['batch_size'])
+    p.add_argument('--epochs',         type=int,   default=DEFAULTS['epochs'])
+    p.add_argument('--lr',             type=float, default=DEFAULTS['lr'])
+    p.add_argument('--weight_decay',   type=float, default=DEFAULTS['weight_decay'])
+    p.add_argument('--drop',           type=float, default=DEFAULTS['drop'])
+    p.add_argument('--alpha',          type=float, default=DEFAULTS['alpha'])
+    p.add_argument('--pattern',        type=int,   default=DEFAULTS['pattern'])
+    p.add_argument('--num_layers',     type=int,   default=DEFAULTS['num_layers'])
+    p.add_argument('--anomaly_rate',   type=int,   default=DEFAULTS['anomaly_rate'])
+    p.add_argument('--hidden_size',    type=int,   nargs=5,
+                   default=DEFAULTS['hidden_size'],
+                   metavar=('FT', 'LSTM', 'MLP', 'GCN', 'OUT'))
+    p.add_argument('--num_candidates', type=int,   nargs='+',
+                   default=DEFAULTS['num_candidates'])
+    return p.parse_args()
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    train(args)
