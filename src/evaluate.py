@@ -114,7 +114,7 @@ def evaluate_sessions(normal_sessions, anomaly_sessions, model,
 
                 out = model(seq, com, quan, timp)
                 for k in k_list:
-                    topk   = torch.argsort(out, dim=1, descending=True)[:, :k]
+                    topk   = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
                     misses = (~torch.isin(labels.unsqueeze(1), topk)).sum().item()
                     hits[k].append(1 if misses >= anomaly_rate else 0)
         return hits
