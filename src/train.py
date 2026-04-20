@@ -153,7 +153,9 @@ def generate_train(train_path, templates_csv, emb_path, com_path, window_size):
     sessions = [
         eval(row['EventSequence'])
         for _, row in train_df.iterrows()
-        if isinstance(row['EventSequence'], str) and row['EventSequence'].strip()
+        if isinstance(row['EventSequence'], str)
+        and row['EventSequence'].strip()
+        and row['EventSequence'].strip().lower() != 'nan'
     ]
 
     dataset = _TrainDataset(sessions, mapping, emb, cop, emb_dim, num_keys, window_size)
@@ -175,7 +177,9 @@ def generate_test(log_path, templates_csv, emb_path, com_path, window_size):
 
     sessions = []
     for _, row in df.iterrows():
-        if not isinstance(row['EventSequence'], str) or not row['EventSequence'].strip():
+        if not isinstance(row['EventSequence'], str) \
+                or not row['EventSequence'].strip() \
+                or row['EventSequence'].strip().lower() == 'nan':
             continue
         seqs = eval(row['EventSequence'])
         n = len(seqs)

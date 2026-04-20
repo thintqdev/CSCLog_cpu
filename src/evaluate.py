@@ -63,7 +63,9 @@ def load_test_sessions(log_path, templates_csv, emb_path, com_path, window_size)
 
     sessions = []
     for _, row in df.iterrows():
-        if not isinstance(row['EventSequence'], str) or not row['EventSequence'].strip():
+        if not isinstance(row['EventSequence'], str) \
+                or not row['EventSequence'].strip() \
+                or row['EventSequence'].strip().lower() == 'nan':
             continue
         seqs = eval(row['EventSequence'])
         n = len(seqs)
