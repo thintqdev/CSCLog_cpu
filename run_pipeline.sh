@@ -53,20 +53,10 @@ if [[ "$SKIP_INSTALL" == false ]]; then
     pip3 install --quiet \
         numpy pandas scikit-learn transformers python-dateutil regex
 
-    # Detect CUDA availability to choose the right torch index URL
-    if python3 -c "import torch; torch.cuda.is_available()" 2>/dev/null; then
-        TORCH_INDEX="https://download.pytorch.org/whl/torch_stable.html"
-    else
-        TORCH_INDEX="https://download.pytorch.org/whl/torch_stable.html"
-    fi
+    pip3 install --quiet torch torchvision \
+        --index-url https://download.pytorch.org/whl/cpu
 
-    pip3 install --quiet torch==1.12.0+cpu torchvision==0.13.0+cpu \
-        -f "$TORCH_INDEX" || warn "torch install failed – may already be installed"
-
-    pip3 install --quiet \
-        torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric \
-        -f https://data.pyg.org/whl/torch-1.12.0+cpu.html \
-        || warn "torch-geometric install failed – may already be installed"
+    pip3 install --quiet torch-geometric
 
     info "Dependencies installed."
 fi
