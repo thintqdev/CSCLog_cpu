@@ -19,6 +19,7 @@ Outputs:
 import sys
 import os
 import json
+import re
 import argparse
 import random
 import collections
@@ -87,6 +88,16 @@ def _parse_ts(s: str):
     return dateutil.parser.parse(s, yearfirst=True)
 
 
+_NAN_RE = re.compile(r'\bnan\b')
+
+
+def _safe_eval(s):
+    """eval an EventSequence string, replacing bare nan tokens with None."""
+    if not isinstance(s, str) or not s.strip() or s.strip().lower() == 'nan':
+        return None
+    return eval(_NAN_RE.sub('None', s))
+
+
 class _TrainDataset(torch.utils.data.Dataset):
     """Memory-efficient sliding-window dataset.
 
@@ -151,11 +162,11 @@ def generate_train(train_path, templates_csv, emb_path, com_path, window_size):
     emb_dim  = len(list(emb.values())[0])
 
     sessions = [
-        eval(row['EventSequence'])
-        for _, row in train_df.iterrows()
-        if isinstance(row['EventSequence'], str)
-        and row['EventSequence'].strip()
-        and row['EventSequence'].strip().lower() != 'nan'
+        seq for seq in (
+            _safe_eval(row['EventSequence'])
+            for _, row in train_df.iterrows()
+        )
+        if seq is not None
     ]
 
     dataset = _TrainDataset(sessions, mapping, emb, cop, emb_dim, num_keys, window_size)
@@ -177,11 +188,9 @@ def generate_test(log_path, templates_csv, emb_path, com_path, window_size):
 
     sessions = []
     for _, row in df.iterrows():
-        if not isinstance(row['EventSequence'], str) \
-                or not row['EventSequence'].strip() \
-                or row['EventSequence'].strip().lower() == 'nan':
+        seqs = _safe_eval(row['EventSequence'])
+        if seqs is None:
             continue
-        seqs = eval(row['EventSequence'])
         n = len(seqs)
         if n <= window_size:
             continue

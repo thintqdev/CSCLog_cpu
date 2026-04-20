@@ -12,6 +12,7 @@ Loads the best checkpoint produced by train.py and prints:
 import sys
 import os
 import json
+import re
 import argparse
 
 import numpy as np
@@ -23,6 +24,14 @@ from sklearn.metrics import (
     classification_report,
 )
 import dateutil.parser
+
+_NAN_RE = re.compile(r'\bnan\b')
+
+
+def _safe_eval(s):
+    if not isinstance(s, str) or not s.strip() or s.strip().lower() == 'nan':
+        return None
+    return eval(_NAN_RE.sub('None', s))
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, PROJECT_ROOT)
@@ -63,11 +72,9 @@ def load_test_sessions(log_path, templates_csv, emb_path, com_path, window_size)
 
     sessions = []
     for _, row in df.iterrows():
-        if not isinstance(row['EventSequence'], str) \
-                or not row['EventSequence'].strip() \
-                or row['EventSequence'].strip().lower() == 'nan':
+        seqs = _safe_eval(row['EventSequence'])
+        if seqs is None:
             continue
-        seqs = eval(row['EventSequence'])
         n = len(seqs)
         if n <= window_size:
             continue
