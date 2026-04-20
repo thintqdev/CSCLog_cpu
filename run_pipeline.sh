@@ -38,7 +38,7 @@ step()    { echo; echo -e "${GREEN}═══════════════
             echo -e "${GREEN}══════════════════════════════════════════${NC}"; }
 
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
-command -v python >/dev/null 2>&1 || die "python not found – please install Python 3.9"
+command -v python3 >/dev/null 2>&1 || die "python3 not found – please install Python 3.9"
 
 JSONL="src/dataset/data_full.jsonl"
 [[ -f "$JSONL" ]] || die "Dataset not found: $JSONL"
@@ -50,20 +50,20 @@ BERT_DIR="model/bert"
 # ── Install dependencies ──────────────────────────────────────────────────────
 if [[ "$SKIP_INSTALL" == false ]]; then
     step "Step 0 – Installing dependencies"
-    pip install --quiet \
+    pip3 install --quiet \
         numpy pandas scikit-learn transformers python-dateutil regex
 
     # Detect CUDA availability to choose the right torch index URL
-    if python -c "import torch; torch.cuda.is_available()" 2>/dev/null; then
+    if python3 -c "import torch; torch.cuda.is_available()" 2>/dev/null; then
         TORCH_INDEX="https://download.pytorch.org/whl/torch_stable.html"
     else
         TORCH_INDEX="https://download.pytorch.org/whl/torch_stable.html"
     fi
 
-    pip install --quiet torch==1.12.0+cpu torchvision==0.13.0+cpu \
+    pip3 install --quiet torch==1.12.0+cpu torchvision==0.13.0+cpu \
         -f "$TORCH_INDEX" || warn "torch install failed – may already be installed"
 
-    pip install --quiet \
+    pip3 install --quiet \
         torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric \
         -f https://data.pyg.org/whl/torch-1.12.0+cpu.html \
         || warn "torch-geometric install failed – may already be installed"
@@ -73,17 +73,17 @@ fi
 
 # ── Step 1: Parse logs ────────────────────────────────────────────────────────
 step "Step 1 – Parsing JSONL logs (Drain)"
-python src/parse_logs.py
+python3 src/parse_logs.py
 info "parse_logs.py completed."
 
 # ── Step 2: Preprocess ───────────────────────────────────────────────────────
 step "Step 2 – Preprocessing (embeddings + sessions)"
-python src/preprocess.py
+python3 src/preprocess.py
 info "preprocess.py completed."
 
 # ── Step 3: Train ────────────────────────────────────────────────────────────
 step "Step 3 – Training CSCLog"
-python src/train.py \
+python3 src/train.py \
     --epochs        "$EPOCHS"        \
     --batch_size    "$BATCH_SIZE"    \
     --window_size   "$WINDOW_SIZE"   \
@@ -92,7 +92,7 @@ info "train.py completed."
 
 # ── Step 4: Evaluate ─────────────────────────────────────────────────────────
 step "Step 4 – Evaluating checkpoint"
-python src/evaluate.py \
+python3 src/evaluate.py \
     --num_candidates $NUM_CANDIDATES
 info "evaluate.py completed."
 
