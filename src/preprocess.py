@@ -34,11 +34,11 @@ RESULT_DIR  = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
 OUTPUT_DIR  = RESULT_DIR                                  # same folder
 MODEL_PATH  = os.path.join(PROJECT_ROOT, 'model', 'bert')
 
-STRUCTURED_CSV = os.path.join(RESULT_DIR, 'Linux.log_structured.csv')
-TEMPLATES_CSV  = os.path.join(RESULT_DIR, 'Linux.log_templates.csv')
+STRUCTURED_CSV = os.path.join(RESULT_DIR, 'data_full_structured.csv')
+TEMPLATES_CSV  = os.path.join(RESULT_DIR, 'data_full_templates.csv')
 
-EMB_OUTPUT  = os.path.join(OUTPUT_DIR, 'Linux_sentences_emb.json')
-COM_OUTPUT  = os.path.join(OUTPUT_DIR, 'Linux_component.json')
+EMB_OUTPUT  = os.path.join(OUTPUT_DIR, 'data_full_sentences_emb.json')
+COM_OUTPUT  = os.path.join(OUTPUT_DIR, 'data_full_component.json')
 TRAIN_CSV   = os.path.join(OUTPUT_DIR, 'train_normal.csv')
 VAL_NOR_CSV = os.path.join(OUTPUT_DIR, 'test_normal.csv')
 VAL_ANO_CSV = os.path.join(OUTPUT_DIR, 'test_anomaly.csv')
@@ -47,7 +47,6 @@ VAL_ANO_CSV = os.path.join(OUTPUT_DIR, 'test_anomaly.csv')
 WINDOW_SIZE        = 9      # must match train.py
 TRAIN_RATIO        = 0.7
 ANOMALY_RARE_RATIO = 0.05   # bottom 5% least-common sessions → "anomaly"
-YEAR               = 2004   # Linux.log does not include year; approximate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,21 +158,6 @@ def build_component_map(structured: pd.DataFrame) -> dict:
 # EventSequence  =  list of (EventId, component_key, ISO-timestamp) tuples.
 # ─────────────────────────────────────────────────────────────────────────────
 
-MONTH_MAP = {
-    'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4,
-    'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8,
-    'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12,
-}
-
-
-def parse_linux_time(month, day, time_str, year: int = YEAR) -> str:
-    """Return ISO-8601 string from Linux syslog fields."""
-    m = MONTH_MAP.get(str(month).strip(), 1)
-    d = int(str(day).strip())
-    h, mi, s = str(time_str).strip().split(':')
-    return f'{year}-{m:02d}-{d:02d}T{int(h):02d}:{int(mi):02d}:{int(s):02d}'
-
-
 def build_sessions(structured: pd.DataFrame, com_map: dict, gap_seconds: int = 60):
     """
     Group consecutive log lines that belong to the same component-host pair
@@ -181,11 +165,8 @@ def build_sessions(structured: pd.DataFrame, com_map: dict, gap_seconds: int = 6
     Returns a list of sessions; each session is a list of
     (EventId, component_key, iso_timestamp).
     """
-    # Build timestamp column
+    # iso_time column is already present (written by parse_logs.py from @timestamp)
     structured = structured.copy()
-    structured['iso_time'] = structured.apply(
-        lambda r: parse_linux_time(r['Month'], r['Day'], r['Time']), axis=1
-    )
 
     # Normalise component key to match com_map
     def norm_com(c):

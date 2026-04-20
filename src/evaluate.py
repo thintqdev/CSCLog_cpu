@@ -35,9 +35,9 @@ print(f'[evaluate] Using device: {DEVICE}')
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 RESULT_DIR    = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
-TEMPLATES_CSV = os.path.join(RESULT_DIR, 'Linux.log_templates.csv')
-EMB_PATH      = os.path.join(RESULT_DIR, 'Linux_sentences_emb.json')
-COM_PATH      = os.path.join(RESULT_DIR, 'Linux_component.json')
+TEMPLATES_CSV = os.path.join(RESULT_DIR, 'data_full_templates.csv')
+EMB_PATH      = os.path.join(RESULT_DIR, 'data_full_sentences_emb.json')
+COM_PATH      = os.path.join(RESULT_DIR, 'data_full_component.json')
 TEST_NOR_CSV  = os.path.join(RESULT_DIR, 'test_normal.csv')
 TEST_ANO_CSV  = os.path.join(RESULT_DIR, 'test_anomaly.csv')
 DEFAULT_CKPT  = os.path.join(RESULT_DIR, 'csclog_best.pth')
@@ -100,24 +100,59 @@ def load_test_sessions(log_path, templates_csv, emb_path, com_path, window_size)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_sessions(normal_sessions, anomaly_sessions, model,
-                      num_candidates_list, anomaly_rate=1):
+                      num_candidates_list, anomaly_rate=1, batch_size=256):
+    """Batch all windows across sessions for fast inference."""
     model.eval()
 
     def run(sessions, k_list):
-        hits = {k: [] for k in k_list}
-        with torch.no_grad():
-            for seq, com, quan, timp, labels in sessions:
-                seq    = torch.tensor(seq,    dtype=torch.float)
-                com    = torch.tensor(com,    dtype=torch.long)
-                quan   = torch.tensor(quan,   dtype=torch.float)
-                timp   = torch.tensor(timp,   dtype=torch.float)
-                labels = torch.tensor(labels, dtype=torch.long)
+        if not sessions:
+            return {k: [] for k in k_list}
 
-                out = model(seq, com, quan, timp)
+        # Flatten all windows with their session index
+        all_seq, all_com, all_quan, all_timp, all_labels, session_ids = \
+            [], [], [], [], [], []
+        for sid, (seq, com, quan, timp, labels) in enumerate(sessions):
+            all_seq.extend(seq)
+            all_com.extend(com)
+            all_quan.extend(quan)
+            all_timp.extend(timp)
+            all_labels.extend(labels)
+            session_ids.extend([sid] * len(labels))
+
+        n = len(all_seq)
+        # Per-session miss counters
+        session_misses = {k: [0] * len(sessions) for k in k_list}
+
+        from torch.utils.data import TensorDataset, DataLoader
+        ds = TensorDataset(
+            torch.tensor(all_seq,    dtype=torch.float),
+            torch.tensor(all_com,    dtype=torch.long),
+            torch.tensor(all_quan,   dtype=torch.float),
+            torch.tensor(all_timp,   dtype=torch.float),
+            torch.tensor(all_labels, dtype=torch.long),
+            torch.tensor(session_ids, dtype=torch.long),
+        )
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+
+        with torch.no_grad():
+            for seq_b, com_b, quan_b, timp_b, lab_b, sid_b in loader:
+                seq_b  = seq_b.to(DEVICE)
+                com_b  = com_b.to(DEVICE)
+                quan_b = quan_b.to(DEVICE)
+                timp_b = timp_b.to(DEVICE)
+                lab_b  = lab_b.to(DEVICE)
+
+                out = model(seq_b, com_b, quan_b, timp_b)
                 for k in k_list:
-                    topk   = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
-                    misses = (~torch.isin(labels.unsqueeze(1), topk)).sum().item()
-                    hits[k].append(1 if misses >= anomaly_rate else 0)
+                    topk = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
+                    wrong = ~torch.isin(lab_b.unsqueeze(1), topk)  # (B,)
+                    for i, (is_wrong, sid) in enumerate(zip(wrong, sid_b.tolist())):
+                        if is_wrong:
+                            session_misses[k][sid] += 1
+
+        hits = {k: [1 if session_misses[k][s] >= anomaly_rate else 0
+                    for s in range(len(sessions))]
+                for k in k_list}
         return hits
 
     nor_hits = run(normal_sessions, num_candidates_list)
