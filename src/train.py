@@ -65,7 +65,7 @@ CKPT_PATH     = os.path.join(RESULT_DIR, 'csclog_best.pth')
 # ── Default hyper-params ──────────────────────────────────────────────────────
 DEFAULTS = dict(
     window_size  = 9,
-    batch_size   = 16,
+    batch_size   = 8,
     epochs       = 10,
     lr           = 1e-3,
     weight_decay = 1e-4,
@@ -87,50 +87,72 @@ def _parse_ts(s: str):
     return dateutil.parser.parse(s, yearfirst=True)
 
 
-def generate_train(train_path, templates_csv, emb_path, com_path, window_size):
-    """Return a TensorDataset for sliding-window next-event prediction."""
-    train_df  = pd.read_csv(train_path, engine='c', na_filter=False, memory_map=True)
-    temp_df   = pd.read_csv(templates_csv, index_col='EventId',
-                            engine='c', na_filter=False, memory_map=True)
-    mapping   = {idx: i for i, idx in enumerate(temp_df.index.unique())}
-    emb       = json.load(open(emb_path))
-    cop       = json.load(open(com_path))
-    num_keys  = len(mapping)
+class _TrainDataset(torch.utils.data.Dataset):
+    """Memory-efficient sliding-window dataset.
 
-    inputs, outputs = [], []
-    for _, row in train_df.iterrows():
-        seqs = eval(row['EventSequence'])
-        n = len(seqs)
-        inputs.extend([seqs[i:i + window_size] for i in range(n - window_size)])
-        outputs.extend([mapping[seqs[i + window_size][0]] for i in range(n - window_size)])
+    Keeps raw session lists in memory and encodes each window to tensors
+    on-the-fly inside __getitem__, so only one batch worth of data is
+    ever materialised at a time.
+    """
 
-    inp_enc, com_enc, quan_enc, time_enc = [], [], [], []
-    for events in inputs:
-        # quantity pattern
-        qp = [0] * num_keys
-        for ev, _, _ in events:
-            if ev in mapping:
-                qp[mapping[ev]] += 1
-        quan_enc.append(qp)
+    def __init__(self, sessions, mapping, emb, cop, emb_dim, num_keys, window_size):
+        self.emb      = emb
+        self.cop      = cop
+        self.mapping  = mapping
+        self.emb_dim  = emb_dim
+        self.num_keys = num_keys
+        self.ws       = window_size
+        # Build a flat index of (session_events_list, start_offset) pairs.
+        # Lists are stored by reference so no data is duplicated.
+        self.index: list = []
+        for seqs in sessions:
+            n = len(seqs)
+            for i in range(n - window_size):
+                self.index.append((seqs, i))
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        seqs, i = self.index[idx]
+        window  = seqs[i: i + self.ws]
+        label   = self.mapping.get(seqs[i + self.ws][0], 0)
+
+        qp = [0] * self.num_keys
+        for ev, _, _ in window:
+            if ev in self.mapping:
+                qp[self.mapping[ev]] += 1
 
         inp, com, tm = [], [], []
-        t0 = _parse_ts(events[0][2])
-        for ev, component, ts in events:
-            inp.append(emb.get(ev, [0.0] * len(list(emb.values())[0])))
-            com.append(cop.get(component, 0))
+        t0 = _parse_ts(window[0][2])
+        for ev, component, ts in window:
+            inp.append(self.emb.get(ev, [0.0] * self.emb_dim))
+            com.append(self.cop.get(component, 0))
             tm.append((_parse_ts(ts) - t0).seconds)
-        inp_enc.append(inp)
-        com_enc.append(com)
-        time_enc.append(tm)
 
-    dataset = TensorDataset(
-        torch.tensor(inp_enc,  dtype=torch.float),
-        torch.tensor(com_enc,  dtype=torch.long),
-        torch.tensor(quan_enc, dtype=torch.float),
-        torch.tensor(time_enc, dtype=torch.float),
-        torch.tensor(outputs,  dtype=torch.long),
-    )
-    emb_dim = len(list(emb.values())[0])
+        return (
+            torch.tensor(inp,   dtype=torch.float),
+            torch.tensor(com,   dtype=torch.long),
+            torch.tensor(qp,    dtype=torch.float),
+            torch.tensor(tm,    dtype=torch.float),
+            torch.tensor(label, dtype=torch.long),
+        )
+
+
+def generate_train(train_path, templates_csv, emb_path, com_path, window_size):
+    """Return a lazy Dataset for sliding-window next-event prediction."""
+    train_df = pd.read_csv(train_path, engine='c', na_filter=False, memory_map=True)
+    temp_df  = pd.read_csv(templates_csv, index_col='EventId',
+                           engine='c', na_filter=False, memory_map=True)
+    mapping  = {idx: i for i, idx in enumerate(temp_df.index.unique())}
+    emb      = json.load(open(emb_path))
+    cop      = json.load(open(com_path))
+    num_keys = len(mapping)
+    emb_dim  = len(list(emb.values())[0])
+
+    sessions = [eval(row['EventSequence']) for _, row in train_df.iterrows()]
+
+    dataset = _TrainDataset(sessions, mapping, emb, cop, emb_dim, num_keys, window_size)
     print(f'[train] Training sequences: {len(dataset)}, '
           f'emb_dim={emb_dim}, num_keys={num_keys}, num_coms={len(cop)}')
     return dataset, emb_dim, num_keys, len(cop)
