@@ -9,16 +9,15 @@
 ### Install dependencies
 
 ```bash
-pip install torch==1.12.0+cpu torchvision==0.13.0+cpu \
-    -f https://download.pytorch.org/whl/torch_stable.html
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric \
-    -f https://data.pyg.org/whl/torch-1.12.0+cpu.html
+pip3 install torch-geometric
 
-pip install numpy pandas scikit-learn transformers python-dateutil regex
+pip3 install numpy pandas scikit-learn transformers python-dateutil regex
 ```
 
-> If you have a GPU replace `+cpu` with the matching CUDA variant, e.g. `+cu116`.
+> If you have a GPU replace the index URL with the matching CUDA variant, e.g.  
+> `--index-url https://download.pytorch.org/whl/cu121`
 
 ### Pre-trained BERT model
 
@@ -38,7 +37,7 @@ Download from [bert-base-uncased on Hugging Face](https://huggingface.co/bert-ba
 or run:
 
 ```bash
-python - <<'EOF'
+python3 - <<'EOF'
 from transformers import AutoTokenizer, BertModel
 tok = AutoTokenizer.from_pretrained('bert-base-uncased')
 mdl = BertModel.from_pretrained('bert-base-uncased')

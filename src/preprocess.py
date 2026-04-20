@@ -56,7 +56,9 @@ ANOMALY_RARE_RATIO = 0.05   # bottom 5% least-common sessions → "anomaly"
 STOPWORDS = {'in', 'on', 'with', 'by', 'for', 'at', 'about', 'under', 'of', 'to', 'from'}
 
 
-def get_keys(sentence: str):
+def get_keys(sentence) -> list:
+    if not isinstance(sentence, str) or not sentence.strip():
+        return []
     line = sentence.lower()
     line = re.sub(r'[^\w\u4e00-\u9fff]+', ' ', line)
     return [x for x in line.split() if x not in STOPWORDS]
@@ -120,7 +122,10 @@ def build_embeddings():
     sentences = {
         row['EventId']: get_keys(row['EventTemplate'])
         for _, row in templates.iterrows()
+        if isinstance(row['EventId'], str) and row['EventId']
     }
+    # Drop entries that produced no tokens (avoids downstream divide-by-zero)
+    sentences = {k: v for k, v in sentences.items() if v}
     keys = feature_select(list(sentences.values()))
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
