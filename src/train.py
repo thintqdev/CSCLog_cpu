@@ -250,7 +250,7 @@ def evaluate_topk(normal_sessions, anomaly_sessions, model, num_candidates_list,
                 out = model(seq_b, com_b, quan_b, timp_b)
                 for k in k_list:
                     topk  = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
-                    wrong = ~torch.isin(lab_b.unsqueeze(1), topk)
+                    wrong = ~(lab_b.unsqueeze(1) == topk).any(dim=1)  # shape (B,)
                     for is_wrong, sid in zip(wrong.tolist(), sid_b.tolist()):
                         if is_wrong:
                             session_misses[k][sid] += 1

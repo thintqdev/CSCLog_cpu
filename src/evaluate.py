@@ -145,8 +145,8 @@ def evaluate_sessions(normal_sessions, anomaly_sessions, model,
                 out = model(seq_b, com_b, quan_b, timp_b)
                 for k in k_list:
                     topk = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
-                    wrong = ~torch.isin(lab_b.unsqueeze(1), topk)  # (B,)
-                    for i, (is_wrong, sid) in enumerate(zip(wrong, sid_b.tolist())):
+                    wrong = ~(lab_b.unsqueeze(1) == topk).any(dim=1)  # shape (B,)
+                    for is_wrong, sid in zip(wrong.tolist(), sid_b.tolist()):
                         if is_wrong:
                             session_misses[k][sid] += 1
 
