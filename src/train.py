@@ -150,7 +150,11 @@ def generate_train(train_path, templates_csv, emb_path, com_path, window_size):
     num_keys = len(mapping)
     emb_dim  = len(list(emb.values())[0])
 
-    sessions = [eval(row['EventSequence']) for _, row in train_df.iterrows()]
+    sessions = [
+        eval(row['EventSequence'])
+        for _, row in train_df.iterrows()
+        if isinstance(row['EventSequence'], str) and row['EventSequence'].strip()
+    ]
 
     dataset = _TrainDataset(sessions, mapping, emb, cop, emb_dim, num_keys, window_size)
     print(f'[train] Training sequences: {len(dataset)}, '
@@ -171,6 +175,8 @@ def generate_test(log_path, templates_csv, emb_path, com_path, window_size):
 
     sessions = []
     for _, row in df.iterrows():
+        if not isinstance(row['EventSequence'], str) or not row['EventSequence'].strip():
+            continue
         seqs = eval(row['EventSequence'])
         n = len(seqs)
         if n <= window_size:
