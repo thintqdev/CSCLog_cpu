@@ -84,7 +84,12 @@ DEFAULTS = dict(
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_ts(s: str):
+_DEFAULT_DT = dateutil.parser.parse('2000-01-01T00:00:00')
+
+
+def _parse_ts(s):
+    if not isinstance(s, str) or not s.strip():
+        return _DEFAULT_DT
     return dateutil.parser.parse(s, yearfirst=True)
 
 
