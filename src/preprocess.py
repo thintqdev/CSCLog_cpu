@@ -32,7 +32,9 @@ sys.path.insert(0, PROJECT_ROOT)
 # ── Paths ────────────────────────────────────────────────────────────────────
 RESULT_DIR  = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
 OUTPUT_DIR  = RESULT_DIR                                  # same folder
-MODEL_PATH  = os.path.join(PROJECT_ROOT, 'model', 'bert')
+MODEL_PATH      = os.path.join(PROJECT_ROOT, 'model', 'bert')
+BERT_HF_NAME    = 'bert-base-uncased'
+_WEIGHT_FILES   = ('pytorch_model.bin', 'model.safetensors')
 
 STRUCTURED_CSV = os.path.join(RESULT_DIR, 'data_full_structured.csv')
 TEMPLATES_CSV  = os.path.join(RESULT_DIR, 'data_full_templates.csv')
@@ -115,6 +117,15 @@ def sentence_vec(sentences: dict, keys, tokenizer, model) -> dict:
 # 2. Build sentence embeddings
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _bert_path() -> str:
+    """Return local MODEL_PATH if weights are present, else fall back to HuggingFace Hub."""
+    if any(os.path.exists(os.path.join(MODEL_PATH, f)) for f in _WEIGHT_FILES):
+        return MODEL_PATH
+    print(f'[preprocess] Weights not found in {MODEL_PATH}, '
+          f'downloading "{BERT_HF_NAME}" from HuggingFace Hub …')
+    return BERT_HF_NAME
+
+
 def build_embeddings():
     print('[preprocess] Building sentence embeddings …')
     templates = pd.read_csv(TEMPLATES_CSV)
@@ -128,8 +139,8 @@ def build_embeddings():
     sentences = {k: v for k, v in sentences.items() if v}
     keys = feature_select(list(sentences.values()))
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    bert = BertModel.from_pretrained(MODEL_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(_bert_path())
+    bert = BertModel.from_pretrained(_bert_path())
     bert.eval()
 
     emb = sentence_vec(sentences, keys, tokenizer, bert)
