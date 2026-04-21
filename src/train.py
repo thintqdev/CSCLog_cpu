@@ -14,6 +14,14 @@ Inputs  (produced by preprocess.py):
 
 Outputs:
     dataset/result/csclog_best.pth   – best checkpoint (highest F2-score for anomaly class)
+
+Optimization for large datasets (4M+ logs):
+  • Batch size 32 (stable gradient on large data)
+  • Learning rate 5e-5 (prevent vibration on long plateaus)
+  • Dropout 0.2 + weight_decay 5e-4 (reduce overfitting)
+  • Hidden size 128 (model capacity for complex patterns)
+  • Early stopping after 6 epochs without improvement
+  • LR scheduler patience 4 (allow convergence time)
 """
 
 import sys
@@ -66,12 +74,12 @@ CKPT_PATH     = os.path.join(RESULT_DIR, 'csclog_best.pth')
 # ── Default hyper-params ──────────────────────────────────────────────────────
 DEFAULTS = dict(
     window_size  = 9,
-    batch_size   = 8,
-    epochs       = 10,
-    lr           = 1e-4,
-    weight_decay = 1e-4,
-    drop         = 0.1,
-    hidden_size  = [64, 64, 64, 64, 64],   # ft, lstm, mlp, gcn, out
+    batch_size   = 64,        # GPU: 64 (ổn định gradient + GPU memory efficient)
+    epochs       = 25,        # Tăng từ 10 → 25 (4M logs cần nhiều iteration hơn)
+    lr           = 5e-5,      # Giảm từ 1e-4 → 5e-5 (learning rate cao gây vibration)
+    weight_decay = 5e-4,      # Tăng từ 1e-4 → 5e-4 (regularize trên dataset lớn)
+    drop         = 0.2,       # Tăng từ 0.1 → 0.2 (ngăn overfitting với 4M logs)
+    hidden_size  = [128, 128, 128, 128, 128],  # Tăng từ [64...] (lớn dataset cần model capacity lớn hơn)
     alpha        = 0.8,
     pattern      = 1,
     num_layers   = 2,
@@ -234,7 +242,7 @@ def generate_test(log_path, templates_csv, emb_path, com_path, window_size):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_topk(normal_sessions, anomaly_sessions, model, num_candidates_list,
-                  anomaly_rate=1, batch_size=256):
+                  anomaly_rate=1, batch_size=512):
     """Batch all windows across sessions for fast inference."""
     model.eval()
 
@@ -318,7 +326,7 @@ def train(args):
     train_dataset, emb_dim, num_keys, num_coms = generate_train(
         TRAIN_CSV, TEMPLATES_CSV, EMB_PATH, COM_PATH, args.window_size)
     dataloader = DataLoader(train_dataset, batch_size=args.batch_size,
-                            shuffle=True, pin_memory=False)
+                            shuffle=True, pin_memory=True, num_workers=4)
 
     normal_sessions  = generate_test(TEST_NOR_CSV, TEMPLATES_CSV, EMB_PATH,
                                      COM_PATH, args.window_size)
@@ -350,7 +358,7 @@ def train(args):
     optimizer = optim.Adam(model.parameters(), lr=args.lr,
                            weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=2)
+        optimizer, mode='max', factor=0.5, patience=4, verbose=True)
     criterion = nn.CrossEntropyLoss()
 
     best_fbeta, best_epoch = 0.0, 0
@@ -358,6 +366,8 @@ def train(args):
     # ------------------------------------------------------------------
     # Epoch loop
     # ------------------------------------------------------------------
+    patience_counter = 0
+    patience_limit = 6  # Early stopping if no improvement for 6 epochs
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_losses = []
@@ -377,7 +387,8 @@ def train(args):
             train_losses.append(loss.item())
 
         avg_loss = np.mean(train_losses)
-        print(f'Epoch [{epoch}/{args.epochs}]  loss={avg_loss:.4f}')
+        loss_trend = ' ↓' if len(train_losses) > 100 and np.mean(train_losses[-100:]) < np.mean(train_losses[:100]) else ''
+        print(f'Epoch [{epoch:2d}/{args.epochs}]  loss={avg_loss:.4f}{loss_trend}  patience={patience_counter}/{patience_limit}')
 
         # Evaluate
         res = evaluate_topk(normal_sessions, anomaly_sessions, model,
@@ -388,6 +399,7 @@ def train(args):
             if fbeta > best_fbeta:
                 best_fbeta = fbeta
                 best_epoch = epoch
+                patience_counter = 0  # reset counter on improvement
                 state = {
                     'model':     model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -400,8 +412,15 @@ def train(args):
                 }
                 torch.save(state, CKPT_PATH)
                 print(f'  [train] → New best F2ano={best_fbeta:.3f}, checkpoint saved.')
+            else:
+                patience_counter += 1
         best_k_fbeta = max(v[4] for v in res.values())
         scheduler.step(best_k_fbeta)
+        
+        # Early stopping
+        if patience_counter >= patience_limit:
+            print(f'\n[train] Early stopping triggered (no improvement for {patience_limit} epochs)')
+            break
 
     print(f'\n[train] Best epoch: {best_epoch}  Best F2ano: {best_fbeta:.3f}')
     print(f'[train] Checkpoint: {CKPT_PATH}')

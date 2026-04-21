@@ -182,11 +182,16 @@ def evaluate_sessions(normal_sessions, anomaly_sessions, model,
     for k in num_candidates_list:
         preds  = nor_hits[k] + ano_hits[k]
         labels = [0] * len(nor_hits[k]) + [1] * len(ano_hits[k])
-        acc  = accuracy_score(labels, preds)
-        prec, rec, f1, _ = precision_recall_fscore_support(
-            labels, preds, average='macro', zero_division=0)
-        print(f'TopK={k:2d} | Accuracy={acc:.4f}  Precision={prec:.4f}  '
-              f'Recall={rec:.4f}  F1={f1:.4f}')
+        acc = accuracy_score(labels, preds)
+        prec_arr, rec_arr, f1_arr, _ = precision_recall_fscore_support(
+            labels, preds, average=None, labels=[0, 1], zero_division=0)
+        ano_prec = float(prec_arr[1]) if len(prec_arr) > 1 else 0.0
+        ano_rec  = float(rec_arr[1])  if len(rec_arr)  > 1 else 0.0
+        macro_f1 = float(f1_arr.mean())
+        denom    = 4.0 * ano_prec + ano_rec
+        fbeta2   = 5.0 * ano_prec * ano_rec / denom if denom > 0 else 0.0
+        print(f'TopK={k:2d} | Acc={acc:.4f}  AnoPrec={ano_prec:.4f}  '
+              f'AnoRec={ano_rec:.4f}  F1={macro_f1:.4f}  F2ano={fbeta2:.4f}')
 
     print()
     print('-- Detailed report (TopK=1) --')
@@ -231,8 +236,10 @@ def main():
         drop        = saved_args['drop'],
     ).to(DEVICE)
     model.load_state_dict(ckpt['model'])
+    saved_metric = ckpt.get('fbeta2_ano', ckpt.get('rec', ckpt.get('f1', 0.0)))
+    metric_name  = 'F2ano' if 'fbeta2_ano' in ckpt else ('AnoRec' if 'rec' in ckpt else 'F1')
     print(f'[evaluate] Model restored (epoch {ckpt["epoch"]}, '
-          f'best F1={ckpt["f1"]:.3f})')
+          f'best {metric_name}={saved_metric:.3f})')
 
     # Load test data
     print('[evaluate] Loading test sessions …')
