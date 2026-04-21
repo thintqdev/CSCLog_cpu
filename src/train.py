@@ -367,18 +367,6 @@ def train(args):
     total_params = sum(p.numel() for p in model.parameters())
     print(f'[train] Model parameters: {total_params:,}')
 
-    # Compile model for faster GPU execution (PyTorch 2.0+)
-    # Use backend='eager' to avoid Triton/GCC dependency (Python.h not required).
-    # Falls back silently if compile is unavailable.
-    if DEVICE.type == 'cuda' and hasattr(torch, 'compile'):
-        try:
-            import torch._dynamo as _dynamo
-            _dynamo.config.suppress_errors = True
-            model = torch.compile(model, backend='eager')
-            print('[train] torch.compile enabled (eager backend)')
-        except Exception:
-            pass
-
     optimizer = optim.Adam(model.parameters(), lr=args.lr,
                            weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -439,10 +427,8 @@ def train(args):
                 best_fbeta = fbeta
                 best_epoch = epoch
                 patience_counter = 0  # reset counter on improvement
-                # torch.compile wraps model; unwrap to get clean state_dict
-                _model = model._orig_mod if hasattr(model, '_orig_mod') else model
                 state = {
-                    'model':     _model.state_dict(),
+                    'model':     model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'epoch':     epoch,
                     'fbeta2_ano': best_fbeta,

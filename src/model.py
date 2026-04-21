@@ -116,7 +116,7 @@ class IREncoder(nn.Module):
 
     def forward(self, x, index):
         device = x.device
-        padding = torch.zeros(self.com_num, self.dmodel, device=device)
+        padding = torch.zeros(self.com_num, self.dmodel, device=device, dtype=x.dtype)
         padding[index] = x
 
         edge_index = self._build_edge_index(index, device)
