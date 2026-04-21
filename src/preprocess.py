@@ -48,7 +48,8 @@ VAL_ANO_CSV = os.path.join(OUTPUT_DIR, 'test_anomaly.csv')
 # ── Hyper-params ─────────────────────────────────────────────────────────────
 WINDOW_SIZE        = 9      # must match train.py
 TRAIN_RATIO        = 0.7
-ANOMALY_RARE_RATIO = 0.05   # bottom 5% least-common sessions → "anomaly"
+# Log levels that indicate an anomalous event
+ANOMALY_LEVELS     = {'error', 'critical', 'err', 'crit', 'fatal', 'alert', 'emerg'}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,8 +192,9 @@ def build_sessions(structured: pd.DataFrame, com_map: dict, gap_seconds: int = 6
 
     structured['com_key'] = structured['Component'].apply(norm_com)
 
-    sessions = []
+    sessions      = []
     current_session = []
+    current_has_anomaly = False
     prev_ts = None
 
     for _, row in structured.iterrows():
@@ -206,58 +208,62 @@ def build_sessions(structured: pd.DataFrame, com_map: dict, gap_seconds: int = 6
                 delta = 0
             if delta > gap_seconds:
                 if len(current_session) > WINDOW_SIZE:
-                    sessions.append(current_session)
+                    sessions.append((current_session, current_has_anomaly))
                 current_session = []
+                current_has_anomaly = False
+
+        level = str(row.get('Level', '')).lower().strip()
+        if level in ANOMALY_LEVELS:
+            current_has_anomaly = True
 
         current_session.append((row['EventId'], row['com_key'], ts))
         prev_ts = ts
 
     if len(current_session) > WINDOW_SIZE:
-        sessions.append(current_session)
+        sessions.append((current_session, current_has_anomaly))
 
-    print(f'[preprocess] Total sessions: {len(sessions)}')
+    n_anomaly = sum(1 for _, is_ano in sessions if is_ano)
+    print(f'[preprocess] Total sessions: {len(sessions)}  '
+          f'(anomalous by level: {n_anomaly}, '
+          f'normal: {len(sessions) - n_anomaly})')
     return sessions
 
 
 def split_and_save(sessions: list):
     """
     Split sessions into train_normal, test_normal, test_anomaly.
-    Since Linux.log has no labels we use a frequency heuristic:
-      rare sessions (bottom ANOMALY_RARE_RATIO) → anomaly for testing.
+
+    Anomaly label: a session is anomalous if it contains at least one log
+    line whose Level is ERROR, CRITICAL, or equivalent (see ANOMALY_LEVELS).
+    This is semantically correct for operational log data.
+
+    Split strategy:
+      - Training: first TRAIN_RATIO of *normal* sessions only
+        (CSCLog is trained on normal behaviour exclusively)
+      - Test normal:  remaining normal sessions
+      - Test anomaly: all anomalous sessions (any split position)
     """
-    n = len(sessions)
-    n_train = int(n * TRAIN_RATIO)
+    normal_sessions  = [s for s, is_ano in sessions if not is_ano]
+    anomaly_sessions = [s for s, is_ano in sessions if is_ano]
 
-    train_sessions = sessions[:n_train]
-    test_sessions  = sessions[n_train:]
-
-    # Heuristic: count template occurrences in test sessions
-    from collections import Counter
-    test_counts = Counter()
-    for s in test_sessions:
-        for ev, _, _ in s:
-            test_counts[id(s)] += 1  # session length as proxy
-
-    # Mark bottom 5% as anomalous
-    lengths = sorted([len(s) for s in test_sessions])
-    threshold = lengths[max(0, int(len(lengths) * ANOMALY_RARE_RATIO) - 1)]
-
-    test_normal  = [s for s in test_sessions if len(s) > threshold]
-    test_anomaly = [s for s in test_sessions if len(s) <= threshold]
+    n_train = int(len(normal_sessions) * TRAIN_RATIO)
+    train_sessions = normal_sessions[:n_train]
+    test_normal    = normal_sessions[n_train:]
+    test_anomaly   = anomaly_sessions
 
     def to_df(session_list):
-        rows = []
-        for s in session_list:
-            rows.append({'EventSequence': str(s)})
-        return pd.DataFrame(rows)
+        return pd.DataFrame([{'EventSequence': str(s)} for s in session_list])
 
     to_df(train_sessions).to_csv(TRAIN_CSV,   index=False)
     to_df(test_normal).to_csv(VAL_NOR_CSV,    index=False)
     to_df(test_anomaly).to_csv(VAL_ANO_CSV,   index=False)
 
+    total_test = len(test_normal) + len(test_anomaly)
+    ratio = len(test_anomaly) / total_test if total_test else 0
     print(f'[preprocess] train_normal:  {len(train_sessions)} sessions → {TRAIN_CSV}')
     print(f'[preprocess] test_normal:   {len(test_normal)} sessions → {VAL_NOR_CSV}')
     print(f'[preprocess] test_anomaly:  {len(test_anomaly)} sessions → {VAL_ANO_CSV}')
+    print(f'[preprocess] Test anomaly ratio: {ratio:.1%}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────

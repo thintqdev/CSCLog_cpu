@@ -324,6 +324,11 @@ def train(args):
                                      COM_PATH, args.window_size)
     anomaly_sessions = generate_test(TEST_ANO_CSV, TEMPLATES_CSV, EMB_PATH,
                                      COM_PATH, args.window_size)
+    total_test = len(normal_sessions) + len(anomaly_sessions)
+    ano_ratio  = len(anomaly_sessions) / total_test if total_test else 0
+    print(f'[train] Test set: {len(normal_sessions)} normal, '
+          f'{len(anomaly_sessions)} anomaly '
+          f'(anomaly ratio = {ano_ratio:.1%})')
 
     # ------------------------------------------------------------------
     # Model
