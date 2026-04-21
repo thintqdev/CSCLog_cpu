@@ -368,12 +368,16 @@ def train(args):
     print(f'[train] Model parameters: {total_params:,}')
 
     # Compile model for faster GPU execution (PyTorch 2.0+)
+    # Use backend='eager' to avoid Triton/GCC dependency (Python.h not required).
+    # Falls back silently if compile is unavailable.
     if DEVICE.type == 'cuda' and hasattr(torch, 'compile'):
         try:
-            model = torch.compile(model)
-            print('[train] torch.compile enabled')
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+            model = torch.compile(model, backend='eager')
+            print('[train] torch.compile enabled (eager backend)')
         except Exception:
-            pass  # fallback silently if compile fails
+            pass
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr,
                            weight_decay=args.weight_decay)
@@ -381,8 +385,8 @@ def train(args):
         optimizer, mode='max', factor=0.5, patience=4)
     criterion = nn.CrossEntropyLoss()
     # AMP scaler: fp16 on GPU, disabled on CPU
-    use_amp  = (DEVICE.type == 'cuda')
-    scaler   = torch.cuda.amp.GradScaler(enabled=use_amp)
+    use_amp = (DEVICE.type == 'cuda')
+    scaler  = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     best_fbeta, best_epoch = 0.0, 0
 
