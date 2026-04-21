@@ -18,6 +18,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import TensorDataset, DataLoader
 from sklearn.metrics import (
     precision_recall_fscore_support,
     accuracy_score,
@@ -135,39 +136,43 @@ def evaluate_sessions(normal_sessions, anomaly_sessions, model,
             all_labels.extend(labels)
             session_ids.extend([sid] * len(labels))
 
-        n = len(all_seq)
-        # Per-session miss counters
-        session_misses = {k: [0] * len(sessions) for k in k_list}
+        # Vectorised miss counters (no Python loop per window)
+        session_misses = {k: torch.zeros(len(sessions), dtype=torch.long)
+                          for k in k_list}
 
-        from torch.utils.data import TensorDataset, DataLoader
-        ds = TensorDataset(
-            torch.tensor(all_seq,    dtype=torch.float),
-            torch.tensor(all_com,    dtype=torch.long),
-            torch.tensor(all_quan,   dtype=torch.float),
-            torch.tensor(all_timp,   dtype=torch.float),
-            torch.tensor(all_labels, dtype=torch.long),
+        pin    = (DEVICE.type == 'cuda')
+        ds     = TensorDataset(
+            torch.tensor(all_seq,     dtype=torch.float),
+            torch.tensor(all_com,     dtype=torch.long),
+            torch.tensor(all_quan,    dtype=torch.float),
+            torch.tensor(all_timp,    dtype=torch.float),
+            torch.tensor(all_labels,  dtype=torch.long),
             torch.tensor(session_ids, dtype=torch.long),
         )
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                            pin_memory=pin, num_workers=4)
 
+        use_amp = (DEVICE.type == 'cuda')
         with torch.no_grad():
             for seq_b, com_b, quan_b, timp_b, lab_b, sid_b in loader:
-                seq_b  = seq_b.to(DEVICE)
-                com_b  = com_b.to(DEVICE)
-                quan_b = quan_b.to(DEVICE)
-                timp_b = timp_b.to(DEVICE)
-                lab_b  = lab_b.to(DEVICE)
+                seq_b  = seq_b.to(DEVICE, non_blocking=True)
+                com_b  = com_b.to(DEVICE, non_blocking=True)
+                quan_b = quan_b.to(DEVICE, non_blocking=True)
+                timp_b = timp_b.to(DEVICE, non_blocking=True)
+                lab_b  = lab_b.to(DEVICE, non_blocking=True)
 
-                out = model(seq_b, com_b, quan_b, timp_b)
+                with torch.autocast(device_type=DEVICE.type, enabled=use_amp):
+                    out = model(seq_b, com_b, quan_b, timp_b)
                 for k in k_list:
-                    topk = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
-                    wrong = ~(lab_b.unsqueeze(1) == topk).any(dim=1)  # shape (B,)
-                    for is_wrong, sid in zip(wrong.tolist(), sid_b.tolist()):
-                        if is_wrong:
-                            session_misses[k][sid] += 1
+                    topk      = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
+                    wrong     = ~(lab_b.unsqueeze(1) == topk).any(dim=1)  # (B,)
+                    wrong_sid = sid_b[wrong].cpu()
+                    if wrong_sid.numel() > 0:
+                        session_misses[k].scatter_add_(
+                            0, wrong_sid,
+                            torch.ones(wrong_sid.numel(), dtype=torch.long))
 
-        hits = {k: [1 if session_misses[k][s] >= anomaly_rate else 0
-                    for s in range(len(sessions))]
+        hits = {k: (session_misses[k] >= anomaly_rate).long().tolist()
                 for k in k_list}
         return hits
 
@@ -220,7 +225,7 @@ def main():
 
     # Load checkpoint
     print(f'[evaluate] Loading checkpoint: {args.checkpoint}')
-    ckpt = torch.load(args.checkpoint, map_location=DEVICE)
+    ckpt = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)
     saved_args = ckpt['args']
     window_size = saved_args['window_size']
 

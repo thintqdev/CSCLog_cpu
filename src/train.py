@@ -372,8 +372,8 @@ def train(args):
     # Falls back silently if compile is unavailable.
     if DEVICE.type == 'cuda' and hasattr(torch, 'compile'):
         try:
-            import torch._dynamo
-            torch._dynamo.config.suppress_errors = True
+            import torch._dynamo as _dynamo
+            _dynamo.config.suppress_errors = True
             model = torch.compile(model, backend='eager')
             print('[train] torch.compile enabled (eager backend)')
         except Exception:

@@ -207,12 +207,12 @@ def build_sessions(structured: pd.DataFrame, com_map: dict, gap_seconds: int = 6
     current_has_anomaly = False
     prev_ts = None
 
+    from dateutil.parser import parse as dtparse
     for _, row in structured.iterrows():
         ts = row['iso_time']
         # detect session boundary: gap > gap_seconds or missing event
         if prev_ts is not None:
             try:
-                from dateutil.parser import parse as dtparse
                 delta = (dtparse(ts) - dtparse(prev_ts)).seconds
             except Exception:
                 delta = 0
