@@ -13,7 +13,7 @@ Inputs  (produced by preprocess.py):
     dataset/result/Linux_component.json
 
 Outputs:
-    dataset/result/csclog_best.pth   – best checkpoint (highest F1)
+    dataset/result/csclog_best.pth   – best checkpoint (highest anomaly Recall)
 """
 
 import sys
@@ -68,7 +68,7 @@ DEFAULTS = dict(
     window_size  = 9,
     batch_size   = 8,
     epochs       = 10,
-    lr           = 1e-3,
+    lr           = 1e-4,
     weight_decay = 1e-4,
     drop         = 0.1,
     hidden_size  = [64, 64, 64, 64, 64],   # ft, lstm, mlp, gcn, out
@@ -119,12 +119,13 @@ class _TrainDataset(torch.utils.data.Dataset):
         self.num_keys = num_keys
         self.ws       = window_size
         # Build a flat index of (session_events_list, start_offset) pairs.
-        # Lists are stored by reference so no data is duplicated.
+        # Skip windows whose target EventId is None (unknown after NaN substitution).
         self.index: list = []
         for seqs in sessions:
             n = len(seqs)
             for i in range(n - window_size):
-                self.index.append((seqs, i))
+                if seqs[i + window_size][0] is not None:
+                    self.index.append((seqs, i))
 
     def __len__(self):
         return len(self.index)
@@ -291,9 +292,13 @@ def evaluate_topk(normal_sessions, anomaly_sessions, model, num_candidates_list,
         preds  = nor_hits[k] + ano_hits[k]
         labels = [0] * len(nor_hits[k]) + [1] * len(ano_hits[k])
         acc = accuracy_score(labels, preds)
-        prec, rec, f1, _ = precision_recall_fscore_support(
-            labels, preds, average='macro', zero_division=0)
-        results[k] = (acc, prec, rec, f1)
+        prec_arr, rec_arr, f1_arr, _ = precision_recall_fscore_support(
+            labels, preds, average=None, labels=[0, 1], zero_division=0)
+        # Minimise False Negatives: track recall on the anomaly class (class 1)
+        ano_rec    = float(rec_arr[1]) if len(rec_arr) > 1 else 0.0
+        macro_prec = float(prec_arr.mean())
+        macro_f1   = float(f1_arr.mean())
+        results[k] = (acc, macro_prec, ano_rec, macro_f1)
     return results
 
 
@@ -334,9 +339,11 @@ def train(args):
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr,
                            weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=2)
     criterion = nn.CrossEntropyLoss()
 
-    best_f1, best_epoch = 0.0, 0
+    best_rec, best_epoch = 0.0, 0
 
     # ------------------------------------------------------------------
     # Epoch loop
@@ -355,6 +362,7 @@ def train(args):
             out  = model(seq, com, quan, timp)
             loss = criterion(out, label)
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_losses.append(loss.item())
 
@@ -366,24 +374,26 @@ def train(args):
                             args.num_candidates, args.anomaly_rate)
         for k, (acc, prec, rec, f1) in res.items():
             print(f'  TopK={k} | Acc={acc:.3f}  Prec={prec:.3f}  '
-                  f'Rec={rec:.3f}  F1={f1:.3f}')
-            if f1 >= best_f1:
-                best_f1 = f1
+                  f'AnoRec={rec:.3f}  F1={f1:.3f}')
+            if rec > best_rec:
+                best_rec = rec
                 best_epoch = epoch
                 state = {
                     'model':     model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'epoch':     epoch,
-                    'f1':        best_f1,
+                    'rec':       best_rec,
                     'args':      vars(args),
                     'emb_dim':   emb_dim,
                     'num_keys':  num_keys,
                     'num_coms':  num_coms,
                 }
                 torch.save(state, CKPT_PATH)
-                print(f'  [train] → New best F1={best_f1:.3f}, checkpoint saved.')
+                print(f'  [train] → New best AnoRec={best_rec:.3f}, checkpoint saved.')
+        best_k_rec = max(v[2] for v in res.values())
+        scheduler.step(best_k_rec)
 
-    print(f'\n[train] Best epoch: {best_epoch}  Best F1: {best_f1:.3f}')
+    print(f'\n[train] Best epoch: {best_epoch}  Best AnoRec: {best_rec:.3f}')
     print(f'[train] Checkpoint: {CKPT_PATH}')
 
 
