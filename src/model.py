@@ -13,6 +13,7 @@ import collections
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.utils.rnn as rnn_utils
 from torch_geometric.nn import GCNConv
 
 
@@ -193,28 +194,62 @@ class CSCLog(nn.Module):
         _q_x   : (B, num_keys)     – quantity pattern (unused in attention path)
         t_x    : (B, W)            – time deltas (seconds from window start)
         """
+        B, W, _ = x.shape
+
         # (a) Fuse embedding + time
         x = self.ftencoder((x, t_x))               # (B, W, ft_hid)
 
         # (b) Sequence-level LSTM
         seq_out = self.lstm_seq(x)                  # (B, lstm_hid)
 
-        # (b+c+d) Component-level path
-        batch_size = x.shape[0]
+        # (c) Component-level: collect ALL component sub-sequences across the
+        #     entire batch, then run ONE batched LSTM call instead of
+        #     B × n_coms separate calls (the original bottleneck).
+        index_list = index.cpu().tolist()           # avoid per-element .item() syncs
+
+        all_seqs:    list = []   # (n_events_i, ft_hid) tensors
+        all_lengths: list = []
+        batch_com_maps: list = []  # per-sample {com_id → flat_idx}
+
+        for i in range(B):
+            com_positions: dict = {}
+            for j, cid in enumerate(index_list[i]):
+                com_positions.setdefault(cid, []).append(j)
+
+            com_map = {}
+            for cid, positions in com_positions.items():
+                all_seqs.append(x[i, positions, :])  # slice (no copy needed)
+                all_lengths.append(len(positions))
+                com_map[cid] = len(all_seqs) - 1
+            batch_com_maps.append(com_map)
+
+        # Pad all component sequences → single batched LSTM forward
+        N       = len(all_seqs)
+        max_len = max(all_lengths)
+        ft_hid  = x.shape[-1]
+
+        padded = torch.zeros(N, max_len, ft_hid, device=x.device, dtype=x.dtype)
+        for k, seq in enumerate(all_seqs):
+            padded[k, :all_lengths[k]] = seq
+
+        lengths_t = torch.tensor(all_lengths, dtype=torch.long)
+        packed    = rnn_utils.pack_padded_sequence(
+            padded, lengths_t, batch_first=True, enforce_sorted=False)
+        h0 = torch.zeros(self.lstm_com.num_layers, N, self.lstm_hid,
+                         device=x.device, dtype=x.dtype)
+        _, (h_n, _) = self.lstm_com.lstm(packed, (h0, torch.zeros_like(h0)))
+        lstm_com_out = h_n[-1]  # (N, lstm_hid)
+
+        # (d) Per-sample GCN + attention (lightweight, not the bottleneck)
         com_outs = []
-        for i in range(batch_size):
-            res = self._resolve(x[i], index[i])     # {com_id: [emb, ...]}
-            ac = []
-            for com_id, embs in res.items():
-                stack = torch.stack(embs).unsqueeze(0)  # (1, n_logs, ft_hid)
-                ac.append(self.lstm_com(stack).squeeze(0))
-            ac = torch.stack(ac)                         # (n_coms, lstm_hid)
+        for i in range(B):
+            com_map     = batch_com_maps[i]
+            flat_idxs   = list(com_map.values())
+            ac          = lstm_com_out[flat_idxs]  # (n_coms, lstm_hid)
 
-            # (c) GCN relation only when >1 component present
             if ac.shape[0] > 1:
-                ac = self.irencoder(ac, list(res.keys()))
+                ac = self.irencoder(ac, list(com_map.keys()))
 
-            # (d) Attention pooling over components
             com_out = self._attention_pool(ac.unsqueeze(0))  # (1, lstm_hid)
             com_outs.append(com_out)
 
