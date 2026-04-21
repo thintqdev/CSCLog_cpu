@@ -60,6 +60,10 @@ seed_everything(42)
 # ── Device: GPU if available, else CPU ──────────────────────────────────────
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[train] Using device: {DEVICE}')
+if DEVICE.type == 'cuda':
+    torch.backends.cudnn.benchmark = True   # auto-tune CUDA kernels
+    print(f'[train] GPU: {torch.cuda.get_device_name(0)}  '
+          f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 RESULT_DIR   = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
@@ -74,12 +78,12 @@ CKPT_PATH     = os.path.join(RESULT_DIR, 'csclog_best.pth')
 # ── Default hyper-params ──────────────────────────────────────────────────────
 DEFAULTS = dict(
     window_size  = 9,
-    batch_size   = 64,        # GPU: 64 (ổn định gradient + GPU memory efficient)
-    epochs       = 25,        # Tăng từ 10 → 25 (4M logs cần nhiều iteration hơn)
-    lr           = 5e-5,      # Giảm từ 1e-4 → 5e-5 (learning rate cao gây vibration)
-    weight_decay = 5e-4,      # Tăng từ 1e-4 → 5e-4 (regularize trên dataset lớn)
-    drop         = 0.2,       # Tăng từ 0.1 → 0.2 (ngăn overfitting với 4M logs)
-    hidden_size  = [128, 128, 128, 128, 128],  # Tăng từ [64...] (lớn dataset cần model capacity lớn hơn)
+    batch_size   = 256,       # GPU: 256 (4× previous, fills GPU pipeline)
+    epochs       = 25,
+    lr           = 2e-4,      # Linear-scaled: 5e-5 × (256/64) = 2e-4
+    weight_decay = 5e-4,
+    drop         = 0.2,
+    hidden_size  = [128, 128, 128, 128, 128],
     alpha        = 0.8,
     pattern      = 1,
     num_layers   = 2,
@@ -242,7 +246,7 @@ def generate_test(log_path, templates_csv, emb_path, com_path, window_size):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_topk(normal_sessions, anomaly_sessions, model, num_candidates_list,
-                  anomaly_rate=1, batch_size=512):
+                  anomaly_rate=1, batch_size=512, use_amp=False):
     """Batch all windows across sessions for fast inference."""
     model.eval()
 
@@ -260,7 +264,9 @@ def evaluate_topk(normal_sessions, anomaly_sessions, model, num_candidates_list,
             all_labels.extend(labels)
             session_ids.extend([sid] * len(labels))
 
-        session_misses = {k: [0] * len(sessions) for k in k_list}
+        # Vectorised miss counters (no Python loop per window)
+        session_misses = {k: torch.zeros(len(sessions), dtype=torch.long)
+                          for k in k_list}
 
         ds = TensorDataset(
             torch.tensor(all_seq,     dtype=torch.float),
@@ -270,26 +276,30 @@ def evaluate_topk(normal_sessions, anomaly_sessions, model, num_candidates_list,
             torch.tensor(all_labels,  dtype=torch.long),
             torch.tensor(session_ids, dtype=torch.long),
         )
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+        pin    = (DEVICE.type == 'cuda')
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                            pin_memory=pin, num_workers=4)
 
         with torch.no_grad():
             for seq_b, com_b, quan_b, timp_b, lab_b, sid_b in loader:
-                seq_b  = seq_b.to(DEVICE)
-                com_b  = com_b.to(DEVICE)
-                quan_b = quan_b.to(DEVICE)
-                timp_b = timp_b.to(DEVICE)
-                lab_b  = lab_b.to(DEVICE)
+                seq_b  = seq_b.to(DEVICE, non_blocking=True)
+                com_b  = com_b.to(DEVICE, non_blocking=True)
+                quan_b = quan_b.to(DEVICE, non_blocking=True)
+                timp_b = timp_b.to(DEVICE, non_blocking=True)
+                lab_b  = lab_b.to(DEVICE, non_blocking=True)
 
-                out = model(seq_b, com_b, quan_b, timp_b)
+                with torch.autocast(device_type=DEVICE.type, enabled=use_amp):
+                    out = model(seq_b, com_b, quan_b, timp_b)
                 for k in k_list:
-                    topk  = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
-                    wrong = ~(lab_b.unsqueeze(1) == topk).any(dim=1)  # shape (B,)
-                    for is_wrong, sid in zip(wrong.tolist(), sid_b.tolist()):
-                        if is_wrong:
-                            session_misses[k][sid] += 1
+                    topk      = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
+                    wrong     = ~(lab_b.unsqueeze(1) == topk).any(dim=1)  # (B,)
+                    wrong_sid = sid_b[wrong].cpu()                         # missed session ids
+                    if wrong_sid.numel() > 0:
+                        session_misses[k].scatter_add_(
+                            0, wrong_sid,
+                            torch.ones(wrong_sid.numel(), dtype=torch.long))
 
-        return {k: [1 if session_misses[k][s] >= anomaly_rate else 0
-                    for s in range(len(sessions))]
+        return {k: (session_misses[k] >= anomaly_rate).long().tolist()
                 for k in k_list}
 
     nor_hits = session_hit(normal_sessions, num_candidates_list)
@@ -326,7 +336,9 @@ def train(args):
     train_dataset, emb_dim, num_keys, num_coms = generate_train(
         TRAIN_CSV, TEMPLATES_CSV, EMB_PATH, COM_PATH, args.window_size)
     dataloader = DataLoader(train_dataset, batch_size=args.batch_size,
-                            shuffle=True, pin_memory=True, num_workers=4)
+                            shuffle=True, pin_memory=(DEVICE.type == 'cuda'),
+                            num_workers=8, persistent_workers=True,
+                            prefetch_factor=4)
 
     normal_sessions  = generate_test(TEST_NOR_CSV, TEMPLATES_CSV, EMB_PATH,
                                      COM_PATH, args.window_size)
@@ -355,11 +367,22 @@ def train(args):
     total_params = sum(p.numel() for p in model.parameters())
     print(f'[train] Model parameters: {total_params:,}')
 
+    # Compile model for faster GPU execution (PyTorch 2.0+)
+    if DEVICE.type == 'cuda' and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model)
+            print('[train] torch.compile enabled')
+        except Exception:
+            pass  # fallback silently if compile fails
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr,
                            weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=4, verbose=True)
+        optimizer, mode='max', factor=0.5, patience=4)
     criterion = nn.CrossEntropyLoss()
+    # AMP scaler: fp16 on GPU, disabled on CPU
+    use_amp  = (DEVICE.type == 'cuda')
+    scaler   = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_fbeta, best_epoch = 0.0, 0
 
@@ -371,20 +394,31 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_losses = []
-        for step, (seq, com, quan, timp, label) in enumerate(dataloader):
-            seq   = seq.to(DEVICE)
-            com   = com.to(DEVICE)
-            quan  = quan.to(DEVICE)
-            timp  = timp.to(DEVICE)
-            label = label.to(DEVICE)
+        total_steps = len(dataloader)
+        report_every = max(1, total_steps // 10)  # report every 10%
+        for step, (seq, com, quan, timp, label) in enumerate(dataloader, 1):
+            seq   = seq.to(DEVICE, non_blocking=True)
+            com   = com.to(DEVICE, non_blocking=True)
+            quan  = quan.to(DEVICE, non_blocking=True)
+            timp  = timp.to(DEVICE, non_blocking=True)
+            label = label.to(DEVICE, non_blocking=True)
 
-            optimizer.zero_grad()
-            out  = model(seq, com, quan, timp)
-            loss = criterion(out, label)
-            loss.backward()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=DEVICE.type, enabled=use_amp):
+                out  = model(seq, com, quan, timp)
+                loss = criterion(out, label)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             train_losses.append(loss.item())
+
+            if step % report_every == 0 or step == total_steps:
+                pct = 100.0 * step / total_steps
+                avg = np.mean(train_losses)
+                print(f'  [{epoch:2d}/{args.epochs}] {pct:5.1f}%  '
+                      f'step={step}/{total_steps}  loss={avg:.4f}', flush=True)
 
         avg_loss = np.mean(train_losses)
         loss_trend = ' ↓' if len(train_losses) > 100 and np.mean(train_losses[-100:]) < np.mean(train_losses[:100]) else ''
@@ -392,7 +426,8 @@ def train(args):
 
         # Evaluate
         res = evaluate_topk(normal_sessions, anomaly_sessions, model,
-                            args.num_candidates, args.anomaly_rate)
+                            args.num_candidates, args.anomaly_rate,
+                            use_amp=use_amp)
         for k, (acc, ano_prec, ano_rec, f1, fbeta) in res.items():
             print(f'  TopK={k} | Acc={acc:.3f}  AnoPrec={ano_prec:.3f}  '
                   f'AnoRec={ano_rec:.3f}  F1={f1:.3f}  F2ano={fbeta:.3f}')
@@ -400,8 +435,10 @@ def train(args):
                 best_fbeta = fbeta
                 best_epoch = epoch
                 patience_counter = 0  # reset counter on improvement
+                # torch.compile wraps model; unwrap to get clean state_dict
+                _model = model._orig_mod if hasattr(model, '_orig_mod') else model
                 state = {
-                    'model':     model.state_dict(),
+                    'model':     _model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'epoch':     epoch,
                     'fbeta2_ano': best_fbeta,

@@ -119,11 +119,21 @@ def sentence_vec(sentences: dict, keys, tokenizer, model) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bert_path() -> str:
-    """Return local MODEL_PATH if weights are present, else fall back to HuggingFace Hub."""
+    """Return local MODEL_PATH if weights are present, else download from HF Hub."""
     if any(os.path.exists(os.path.join(MODEL_PATH, f)) for f in _WEIGHT_FILES):
         return MODEL_PATH
-    print(f'[preprocess] Weights not found in {MODEL_PATH}, '
-          f'downloading "{BERT_HF_NAME}" from HuggingFace Hub …')
+    
+    # Option to download locally first
+    print(f'[preprocess] Weights not found in {MODEL_PATH}')
+    print(f'[preprocess] Option 1: Download locally using wget (offline)')
+    print(f'  mkdir -p {MODEL_PATH}')
+    print(f'  cd {MODEL_PATH}')
+    print(f'  wget https://huggingface.co/google-bert/bert-base-uncased/resolve/main/pytorch_model.bin')
+    print(f'  wget https://huggingface.co/google-bert/bert-base-uncased/resolve/main/config.json')
+    print(f'  wget https://huggingface.co/google-bert/bert-base-uncased/resolve/main/vocab.txt')
+    print(f'\nOption 2: Download from HuggingFace Hub (online)')
+    print(f'  This requires PyTorch >= 2.4')
+    print(f'\nAttempting to download from HuggingFace Hub...')
     return BERT_HF_NAME
 
 
