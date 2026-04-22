@@ -256,7 +256,7 @@ def build_sessions(structured: pd.DataFrame, com_map: dict) -> list:
 
     # Parse timestamps vectorized — much faster than dateutil in a loop
     print('[preprocess]   Parsing timestamps …')
-    df['ts'] = pd.to_datetime(df['iso_time'], errors='coerce', utc=False)
+    df['ts'] = pd.to_datetime(df['iso_time'], errors='coerce', utc=True).dt.tz_convert(None)
     # Fill NaT with a safe default
     df['ts'] = df['ts'].fillna(pd.Timestamp('2000-01-01'))
 
