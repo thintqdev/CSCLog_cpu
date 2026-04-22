@@ -1,20 +1,16 @@
 """
-Step 3: Train CSCLog – MAXIMUM GPU UTILIZATION VERSION
-=======================================================
-Optimizations vs previous version:
-  1.  Gradient accumulation  → effective batch up to 1024 with small VRAM
-  2.  torch.compile           → kernel fusion, 20-40% faster forward+backward
-  3.  Persistent DataLoader   → zero worker re-spawn overhead
-  4.  Fully GPU session_misses in evaluate_topk (no CPU sync per batch)
-  5.  tqdm progress bar       → minimal I/O overhead
-  6.  Warmup + CosineAnnealing LR schedule  → better convergence
-  7.  cudnn.benchmark + TF32  → faster GEMM on Ampere+
-  8.  Pinned memory + non_blocking everywhere
-  9.  GradScaler with dynamic scale        → stable AMP
-  10. Compiled model reused across eval    → no recompile cost
-  11. Dataset: fully vectorised __getitem__ (no Python loops)
-  12. Multi-GPU DataParallel (transparent, auto-detected)
-  13. CUDA streams for overlapping H2D transfer and compute
+Step 3: Train CSCLog – RAM-SAFE VERSION
+============================================================================
+Key fix: generate_test stores ONLY integer indices (ev_wins, com_wins, labels).
+NO embeddings, NO QP matrices stored in memory.
+Everything is computed on-the-fly per batch during evaluation.
+
+RAM usage per session:
+  - ev_wins:  (W, ws) int32
+  - com_wins: (W, ws) int32
+  - labels:   (W,)    int64
+  - tm:       (W, ws) float32   [tiny, kept for model input]
+  Total: ~W * (ws*12 + ws*4 + 8) bytes — ~100x less than storing embeddings
 """
 
 import sys
@@ -23,6 +19,7 @@ import json
 import re
 import argparse
 import random
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -30,21 +27,27 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+from numpy.lib.stride_tricks import sliding_window_view
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 import dateutil.parser
+
+warnings.filterwarnings('ignore', message='.*torch-scatter.*')
+warnings.filterwarnings('ignore', message='.*torch-cluster.*')
+warnings.filterwarnings('ignore', message='.*torch-spline-conv.*')
+warnings.filterwarnings('ignore', message='.*torch-sparse.*')
 
 try:
     from tqdm import tqdm
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
+    print('[train] tqdm not found, using plain progress')
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, PROJECT_ROOT)
 
 from src.model import CSCLog
 
-# ── Reproducibility ────────────────────────────────────────────────────────
 def seed_everything(seed: int = 42):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -55,22 +58,28 @@ def seed_everything(seed: int = 42):
 
 seed_everything(42)
 
-# ── Device setup ────────────────────────────────────────────────────────────
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[train] Using device: {DEVICE}')
 
 if DEVICE.type == 'cuda':
-    torch.backends.cudnn.benchmark = True        # auto-tune CUDA kernels
-    torch.backends.cuda.matmul.allow_tf32 = True # faster GEMM on Ampere+
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    n_gpu = torch.cuda.device_count()
-    for i in range(n_gpu):
-        props = torch.cuda.get_device_properties(i)
-        print(f'[train] GPU {i}: {props.name}  '
-              f'VRAM: {props.total_memory / 1e9:.1f} GB  '
-              f'SM: {props.multi_processor_count}')
 
-# ── Paths ────────────────────────────────────────────────────────────────────
+    props = torch.cuda.get_device_properties(0)
+    total_vram_gb = props.total_memory / 1e9
+    print(f'[train] GPU: {props.name}  VRAM: {total_vram_gb:.1f} GB')
+
+    if total_vram_gb < 12:
+        print('[train] WARNING: Low VRAM detected, using conservative settings')
+        SAFE_BATCH = 128
+    elif total_vram_gb < 16:
+        SAFE_BATCH = 256
+    else:
+        SAFE_BATCH = 512
+else:
+    SAFE_BATCH = 64
+
 RESULT_DIR    = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
 TEMPLATES_CSV = os.path.join(RESULT_DIR, 'data_full_templates.csv')
 EMB_PATH      = os.path.join(RESULT_DIR, 'data_full_sentences_emb.json')
@@ -80,14 +89,13 @@ TEST_NOR_CSV  = os.path.join(RESULT_DIR, 'test_normal.csv')
 TEST_ANO_CSV  = os.path.join(RESULT_DIR, 'test_anomaly.csv')
 CKPT_PATH     = os.path.join(RESULT_DIR, 'csclog_best.pth')
 
-# ── Default hyper-params ─────────────────────────────────────────────────────
 DEFAULTS = dict(
     window_size       = 9,
-    batch_size        = 512,      # per-GPU mini-batch
-    grad_accum        = 2,        # effective batch = batch_size × grad_accum
+    batch_size        = SAFE_BATCH,
+    grad_accum        = 2,
     epochs            = 25,
-    lr                = 3e-4,     # peak LR (cosine schedule)
-    warmup_epochs     = 2,        # linear warm-up
+    lr                = 2e-4,
+    warmup_epochs     = 2,
     weight_decay      = 5e-4,
     drop              = 0.2,
     hidden_size       = [128, 128, 128, 128, 128],
@@ -97,11 +105,10 @@ DEFAULTS = dict(
     num_candidates    = [1],
     anomaly_rate      = 1,
     patience          = 6,
-    compile_model     = False,    # --compile to enable torch.compile
-    eval_batch_size   = 1024,     # larger batch for evaluation (no backward)
+    compile_model     = False,
+    eval_batch_size   = 512,
 )
 
-# ── Timestamp helper ─────────────────────────────────────────────────────────
 _DEFAULT_TS = dateutil.parser.parse('2000-01-01T00:00:00').timestamp()
 _NAN_RE     = re.compile(r'\bnan\b')
 
@@ -121,44 +128,24 @@ def _safe_eval(s):
     return eval(_NAN_RE.sub('None', s))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dataset – fully pre-computed, zero Python overhead in __getitem__
-# ─────────────────────────────────────────────────────────────────────────────
-
 class _TrainDataset(Dataset):
-    """
-    Lazy dataset — stores only compact per-event arrays and an index.
-    Windows are computed on-demand in __getitem__ so that RAM usage is
-    O(total_events × 3 floats) instead of O(total_windows × W × emb_dim).
-
-    Memory layout:
-      emb_matrix : (num_keys, emb_dim)  float32  — shared across workers
-      ev_arr[s]  : (L_s,)               int32    — event index per session
-      com_arr[s] : (L_s,)               int32    — component index per session
-      ts_arr[s]  : (L_s,)               float32  — timestamps per session
-      index      : (N, 2)               int32    — (session_id, window_start)
-      lbl_arr    : (N,)                 int32    — label per window
-    """
-
     def __init__(self, sessions, mapping, emb, cop, emb_dim, num_keys, window_size):
-        print('[dataset] Building lazy index (no large pre-allocation) …')
+        print('[dataset] Building lazy index...')
         ws = window_size
 
-        # Embedding lookup matrix — (num_keys, emb_dim): typically only ~30 MB
         emb_matrix = np.zeros((num_keys, emb_dim), dtype=np.float32)
         for ev, idx in mapping.items():
             if ev in emb:
                 emb_matrix[idx] = emb[ev]
-        self.emb_matrix = emb_matrix  # shared across DataLoader workers (fork)
+        self.emb_matrix = emb_matrix
         self.num_keys   = num_keys
         self.ws         = ws
 
-        # Compact per-session arrays
         self._ev  = []
         self._com = []
         self._ts  = []
 
-        index_rows = []   # list of (session_id, window_start)
+        index_rows = []
         lbl_list   = []
 
         for sid, seqs in enumerate(sessions):
@@ -168,7 +155,7 @@ class _TrainDataset(Dataset):
                  for ev, _, _ in seqs], dtype=np.int32)
             com_idxs = np.array(
                 [cop.get(comp, 0) for _, comp, _ in seqs], dtype=np.int32)
-            ts_vals  = np.array(
+            ts_vals = np.array(
                 [_parse_ts_float(ts) for _, _, ts in seqs], dtype=np.float32)
 
             self._ev.append(ev_idxs)
@@ -182,10 +169,15 @@ class _TrainDataset(Dataset):
                 index_rows.append((sid, i))
                 lbl_list.append(lbl_idx)
 
-        self.index   = np.array(index_rows, dtype=np.int32)  # (N, 2)
+        self.index   = np.array(index_rows, dtype=np.int32)
         self.lbl_arr = np.array(lbl_list,   dtype=np.int64)
-        print(f'[dataset] Lazy index built: {len(self.lbl_arr):,} windows across '
-              f'{len(self._ev):,} sessions.')
+
+        mb_used = (self.emb_matrix.nbytes +
+                   sum(arr.nbytes for arr in self._ev + self._com + self._ts) +
+                   self.index.nbytes + self.lbl_arr.nbytes) / 1024**2
+
+        print(f'[dataset] Built {len(self.lbl_arr):,} windows from '
+              f'{len(self._ev):,} sessions (~{mb_used:.1f} MB)')
 
     def __len__(self):
         return len(self.lbl_arr)
@@ -193,15 +185,15 @@ class _TrainDataset(Dataset):
     def __getitem__(self, idx):
         sid, start = int(self.index[idx, 0]), int(self.index[idx, 1])
         ws  = self.ws
-        ev  = self._ev[sid][start: start + ws]           # (W,)  int32
-        com = self._com[sid][start: start + ws]           # (W,)  int32
-        ts  = self._ts[sid][start: start + ws]            # (W,)  float32
+        ev  = self._ev[sid][start: start + ws]
+        com = self._com[sid][start: start + ws]
+        ts  = self._ts[sid][start: start + ws]
 
-        seq  = self.emb_matrix[ev]                        # (W, emb_dim)
-        tm   = (ts - ts[0]).astype(np.float32)            # relative seconds
-        qp   = np.bincount(ev.astype(np.intp),
-                           minlength=self.num_keys).astype(np.float32)
-        lbl  = self.lbl_arr[idx]
+        seq = self.emb_matrix[ev]
+        tm  = (ts - ts[0]).astype(np.float32)
+        qp  = np.bincount(ev.astype(np.intp),
+                          minlength=self.num_keys).astype(np.float32)
+        lbl = self.lbl_arr[idx]
 
         return (torch.from_numpy(seq),
                 torch.from_numpy(com).long(),
@@ -209,10 +201,6 @@ class _TrainDataset(Dataset):
                 torch.from_numpy(tm),
                 torch.tensor(lbl, dtype=torch.long))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data loading
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _load_artifacts(templates_csv, emb_path, com_path):
     temp_df  = pd.read_csv(templates_csv, index_col='EventId',
@@ -225,6 +213,14 @@ def _load_artifacts(templates_csv, emb_path, com_path):
     return mapping, emb, cop, num_keys, emb_dim
 
 
+def _build_emb_matrix(mapping, emb, num_keys, emb_dim):
+    emb_matrix = np.zeros((num_keys, emb_dim), dtype=np.float32)
+    for ev, idx in mapping.items():
+        if ev in emb:
+            emb_matrix[idx] = emb[ev]
+    return emb_matrix
+
+
 def generate_train(train_path, templates_csv, emb_path, com_path, window_size):
     mapping, emb, cop, num_keys, emb_dim = _load_artifacts(
         templates_csv, emb_path, com_path)
@@ -232,112 +228,144 @@ def generate_train(train_path, templates_csv, emb_path, com_path, window_size):
     sessions = [s for s in (_safe_eval(r['EventSequence'])
                             for _, r in train_df.iterrows()) if s is not None]
     dataset = _TrainDataset(sessions, mapping, emb, cop, emb_dim, num_keys, window_size)
-    print(f'[train] Training sequences: {len(dataset):,}, '
-          f'emb_dim={emb_dim}, num_keys={num_keys}, num_coms={len(cop)}')
+    print(f'[train] Training: {len(dataset):,} samples, '
+          f'emb_dim={emb_dim}, keys={num_keys}, coms={len(cop)}')
     return dataset, emb_dim, num_keys, len(cop)
 
 
 def generate_test(log_path, templates_csv, emb_path, com_path, window_size):
-    """Pre-materialise test sessions as GPU-ready tensors."""
     mapping, emb, cop, num_keys, emb_dim = _load_artifacts(
         templates_csv, emb_path, com_path)
-    df = pd.read_csv(log_path, engine='c', na_filter=False, memory_map=True)
 
-    sessions = []
-    for _, row in df.iterrows():
-        seqs = _safe_eval(row['EventSequence'])
+    df = pd.read_csv(log_path, engine='c', na_filter=False, memory_map=True)
+    print(f'[train] Loading {len(df):,} test sessions from {os.path.basename(log_path)}...')
+
+    raw_seqs = [_safe_eval(r) for r in df['EventSequence']]
+
+    sessions   = []
+    total_wins = 0
+
+    iterator = tqdm(raw_seqs, desc='  Processing', leave=False, dynamic_ncols=True) \
+               if HAS_TQDM else raw_seqs
+
+    for seqs in iterator:
         if seqs is None or len(seqs) <= window_size:
             continue
+
         n = len(seqs)
-        inp, comp, quanp, timep, labels = [], [], [], [], []
-        for i in range(n - window_size):
-            window = seqs[i: i + window_size]
-            ev_win = [mapping.get(ev, 0) for ev, _, _ in window]
-            qp = np.bincount(ev_win, minlength=num_keys).tolist()
-            quanp.append(qp)
+        n_windows = n - window_size
+        if n_windows <= 0:
+            continue
 
-            seq_l, com_l, tm_l = [], [], []
-            t0 = _parse_ts_float(window[0][2])
-            for ev, component, ts in window:
-                seq_l.append(emb.get(ev, [0.0] * emb_dim))
-                com_l.append(cop.get(component, 0))
-                tm_l.append(_parse_ts_float(ts) - t0)
-            inp.append(seq_l)
-            comp.append(com_l)
-            timep.append(tm_l)
-            labels.append(mapping.get(seqs[i + window_size][0], -1))
-        if inp:
-            sessions.append((inp, comp, quanp, timep, labels))
-    print(f'[train] Test sessions: {len(sessions):,}  from {os.path.basename(log_path)}')
-    return sessions
+        events   = [ev   for ev, _, _ in seqs]
+        comps    = [comp for _, comp, _ in seqs]
 
+        ev_idxs  = np.fromiter((mapping.get(ev, 0) for ev in events),
+                               dtype=np.int32, count=n)
+        com_idxs = np.fromiter((cop.get(c, 0) for c in comps),
+                               dtype=np.int32, count=n)
+        ts_vals  = np.arange(n, dtype=np.float32)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Evaluation – all counters on GPU, single H2D transfer at the end
-# ─────────────────────────────────────────────────────────────────────────────
+        ev_wins  = sliding_window_view(ev_idxs,  window_size)[:n_windows].copy()
+        com_wins = sliding_window_view(com_idxs, window_size)[:n_windows].copy()
+        ts_wins  = sliding_window_view(ts_vals,  window_size)[:n_windows]
+
+        tm = (ts_wins - ts_wins[:, :1]).astype(np.float32).copy()
+
+        labels = np.array(
+            [mapping.get(events[i + window_size], -1) for i in range(n_windows)],
+            dtype=np.int64)
+
+        sessions.append((ev_wins, com_wins, tm, labels))
+        total_wins += n_windows
+
+    mb = sum(
+        s[0].nbytes + s[1].nbytes + s[2].nbytes + s[3].nbytes
+        for s in sessions
+    ) / 1024**2
+    print(f'[train] Test: {len(sessions):,} sessions, '
+          f'{total_wins:,} windows, RAM={mb:.0f} MB')
+    return sessions, num_keys, emb_dim, mapping, emb, cop
+
 
 def evaluate_topk(normal_sessions, anomaly_sessions, model,
                   num_candidates_list, anomaly_rate=1,
-                  batch_size=1024, use_amp=False):
-    """
-    GPU-only session miss counting.
-    No CPU sync inside the batch loop → sustained GPU throughput.
-    """
+                  batch_size=512, use_amp=False,
+                  emb_matrix=None, num_keys=None):
+    assert emb_matrix is not None and num_keys is not None, \
+        'emb_matrix and num_keys must be provided'
+
     model.eval()
-    from torch.utils.data import TensorDataset
+    emb_t = torch.from_numpy(emb_matrix).to(DEVICE)
 
     def session_hit(sessions, k_list):
         if not sessions:
             return {k: [] for k in k_list}
 
-        all_seq, all_com, all_quan, all_timp, all_labels, session_ids = \
-            [], [], [], [], [], []
-        for sid, (seq, com, quan, timp, labels) in enumerate(sessions):
-            all_seq.extend(seq);  all_com.extend(com)
-            all_quan.extend(quan); all_timp.extend(timp)
-            all_labels.extend(labels)
-            session_ids.extend([sid] * len(labels))
+        all_ev   = np.concatenate([s[0] for s in sessions], axis=0)
+        all_com  = np.concatenate([s[1] for s in sessions], axis=0)
+        all_timp = np.concatenate([s[2] for s in sessions], axis=0)
+        all_lbl  = np.concatenate([s[3] for s in sessions], axis=0)
+        sid_arr  = np.concatenate([
+            np.full(len(s[3]), sid, dtype=np.int64)
+            for sid, s in enumerate(sessions)
+        ], axis=0)
 
-        # All miss counters live on GPU from the start
-        n_sessions = len(sessions)
+        valid_mask = all_lbl >= 0
+        all_ev   = all_ev[valid_mask]
+        all_com  = all_com[valid_mask]
+        all_timp = all_timp[valid_mask]
+        sid_arr  = sid_arr[valid_mask]
+        all_lbl  = all_lbl[valid_mask]
+
+        if len(all_lbl) == 0:
+            return {k: [0] * len(sessions) for k in k_list}
+
+        n_sessions    = len(sessions)
         session_misses = {k: torch.zeros(n_sessions, dtype=torch.long, device=DEVICE)
                           for k in k_list}
 
-        ds = TensorDataset(
-            torch.tensor(all_seq,     dtype=torch.float),
-            torch.tensor(all_com,     dtype=torch.long),
-            torch.tensor(all_quan,    dtype=torch.float),
-            torch.tensor(all_timp,    dtype=torch.float),
-            torch.tensor(all_labels,  dtype=torch.long),
-            torch.tensor(session_ids, dtype=torch.long),
-        )
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                            pin_memory=(DEVICE.type == 'cuda'),
-                            num_workers=4, prefetch_factor=2)
+        N = len(all_ev)
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            B   = end - start
 
-        with torch.no_grad():
-            for seq_b, com_b, quan_b, timp_b, lab_b, sid_b in loader:
-                seq_b  = seq_b.to(DEVICE,  non_blocking=True)
-                com_b  = com_b.to(DEVICE,  non_blocking=True)
-                quan_b = quan_b.to(DEVICE, non_blocking=True)
-                timp_b = timp_b.to(DEVICE, non_blocking=True)
-                lab_b  = lab_b.to(DEVICE,  non_blocking=True)
-                sid_b  = sid_b.to(DEVICE,  non_blocking=True)  # stay on GPU
+            ev_b   = torch.from_numpy(
+                all_ev[start:end].astype(np.int64)).to(DEVICE)
+            com_b  = torch.from_numpy(
+                all_com[start:end]).long().to(DEVICE)
+            timp_b = torch.from_numpy(
+                all_timp[start:end]).float().to(DEVICE)
+            lab_b  = torch.from_numpy(
+                all_lbl[start:end]).long().to(DEVICE)
+            sid_b  = torch.from_numpy(
+                sid_arr[start:end]).to(DEVICE)
 
-                with torch.autocast(device_type=DEVICE.type, enabled=use_amp):
-                    out = model(seq_b, com_b, quan_b, timp_b)
+            seq_b = emb_t[ev_b]
 
-                for k in k_list:
-                    topk     = torch.argsort(out, dim=1, descending=True)[:, :k]
-                    wrong    = ~(lab_b.unsqueeze(1) == topk).any(dim=1)
-                    wrong_sid = sid_b[wrong]
-                    if wrong_sid.numel() > 0:
-                        # GPU scatter_add — zero CPU sync
-                        session_misses[k].scatter_add_(
-                            0, wrong_sid,
-                            torch.ones(wrong_sid.numel(), dtype=torch.long, device=DEVICE))
+            qp_b = torch.zeros(B, num_keys, dtype=torch.float32, device=DEVICE)
+            qp_b.scatter_add_(
+                1,
+                ev_b.reshape(B, -1),
+                torch.ones(B, ev_b.shape[1], dtype=torch.float32, device=DEVICE)
+            )
 
-        # Single D2H transfer per k at the very end
+            with torch.no_grad():
+                if use_amp:
+                    with torch.autocast(device_type='cuda'):
+                        out = model(seq_b, com_b, qp_b, timp_b)
+                else:
+                    out = model(seq_b, com_b, qp_b, timp_b)
+
+            for k in k_list:
+                topk      = torch.argsort(out, dim=1, descending=True)[:, :k]
+                wrong     = ~(lab_b.unsqueeze(1) == topk).any(dim=1)
+                wrong_sid = sid_b[wrong]
+                if wrong_sid.numel() > 0:
+                    session_misses[k].scatter_add_(
+                        0, wrong_sid,
+                        torch.ones(wrong_sid.numel(), dtype=torch.long, device=DEVICE))
+
         return {k: (session_misses[k] >= anomaly_rate).long().cpu().tolist()
                 for k in k_list}
 
@@ -360,12 +388,7 @@ def evaluate_topk(normal_sessions, anomaly_sessions, model,
     return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LR schedule helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _make_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch):
-    """Linear warm-up → CosineAnnealing (step-level scheduler)."""
     warmup_steps = warmup_epochs * steps_per_epoch
     total_steps  = total_epochs  * steps_per_epoch
 
@@ -378,43 +401,37 @@ def _make_scheduler(optimizer, warmup_epochs, total_epochs, steps_per_epoch):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Training loop
-# ─────────────────────────────────────────────────────────────────────────────
-
 def train(args):
-    # ── DataLoader ────────────────────────────────────────────────────────
     train_dataset, emb_dim, num_keys, num_coms = generate_train(
         TRAIN_CSV, TEMPLATES_CSV, EMB_PATH, COM_PATH, args.window_size)
 
-    # Optimal num_workers: 4 per GPU (avoids PCIe saturation)
-    n_workers = min(8, 4 * max(1, torch.cuda.device_count()))
+    n_workers = 4 if torch.cuda.is_available() else 2
+
     dataloader = DataLoader(
         train_dataset,
-        batch_size        = args.batch_size,
-        shuffle           = True,
-        pin_memory        = (DEVICE.type == 'cuda'),
-        num_workers       = n_workers,
-        persistent_workers= True,          # keep workers alive between epochs
-        prefetch_factor   = 4,             # pre-load 4 batches per worker
-        drop_last         = True,          # stable gradient accumulation
+        batch_size         = args.batch_size,
+        shuffle            = True,
+        pin_memory         = (DEVICE.type == 'cuda'),
+        num_workers        = n_workers,
+        persistent_workers = True,
+        prefetch_factor    = 2,
+        drop_last          = True,
     )
 
     print(f'[train] DataLoader: batch={args.batch_size}, '
-          f'grad_accum={args.grad_accum} → '
-          f'effective_batch={args.batch_size * args.grad_accum}, '
+          f'accum={args.grad_accum} → effective={args.batch_size * args.grad_accum}, '
           f'workers={n_workers}')
 
-    normal_sessions  = generate_test(TEST_NOR_CSV, TEMPLATES_CSV, EMB_PATH,
-                                     COM_PATH, args.window_size)
-    anomaly_sessions = generate_test(TEST_ANO_CSV, TEMPLATES_CSV, EMB_PATH,
-                                     COM_PATH, args.window_size)
-    total_test = len(normal_sessions) + len(anomaly_sessions)
-    ano_ratio  = len(anomaly_sessions) / total_test if total_test else 0
-    print(f'[train] Test set: {len(normal_sessions)} normal, '
-          f'{len(anomaly_sessions)} anomaly (ratio={ano_ratio:.1%})')
+    normal_sessions,  num_keys_t, emb_dim_t, mapping, emb, cop = generate_test(
+        TEST_NOR_CSV, TEMPLATES_CSV, EMB_PATH, COM_PATH, args.window_size)
+    anomaly_sessions, *_ = generate_test(
+        TEST_ANO_CSV, TEMPLATES_CSV, EMB_PATH, COM_PATH, args.window_size)
 
-    # ── Model ─────────────────────────────────────────────────────────────
+    print(f'[train] Test data ready: {len(normal_sessions)} normal, '
+          f'{len(anomaly_sessions)} anomaly sessions')
+
+    emb_matrix = _build_emb_matrix(mapping, emb, num_keys, emb_dim)
+
     model = CSCLog(
         input_size  = emb_dim,
         com_num     = num_coms,
@@ -426,156 +443,149 @@ def train(args):
         drop        = args.drop,
     ).to(DEVICE)
 
-    # Multi-GPU (DataParallel) — transparent, no code changes needed
-    if torch.cuda.device_count() > 1:
-        print(f'[train] Using DataParallel across {torch.cuda.device_count()} GPUs')
-        model = nn.DataParallel(model)
-
-    # torch.compile — fuses ops, reduces kernel launch overhead (~20-40% speedup)
-    if args.compile_model and hasattr(torch, 'compile'):
-        print('[train] Compiling model with torch.compile (mode=max-autotune)…')
-        model = torch.compile(model, mode='max-autotune')
-
     total_params = sum(p.numel() for p in model.parameters())
-    print(f'[train] Model parameters: {total_params:,}')
+    print(f'[train] Model: {total_params:,} parameters')
 
-    # ── Optimizer + AMP ───────────────────────────────────────────────────
     optimizer = optim.AdamW(model.parameters(),
-                            lr=args.lr, weight_decay=args.weight_decay,
-                            fused=(DEVICE.type == 'cuda'))  # fused kernel on GPU
+                            lr=args.lr, weight_decay=args.weight_decay)
     use_amp   = (DEVICE.type == 'cuda')
-    scaler    = torch.amp.GradScaler('cuda', enabled=use_amp)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # slight smoothing helps generalisation
+    criterion = nn.CrossEntropyLoss()
 
     steps_per_epoch = len(dataloader)
     scheduler = _make_scheduler(optimizer, args.warmup_epochs, args.epochs,
                                  steps_per_epoch)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
 
     best_fbeta, best_epoch = 0.0, 0
     patience_counter = 0
-    global_step = 0
 
-    # ── Epoch loop ────────────────────────────────────────────────────────
     for epoch in range(1, args.epochs + 1):
         model.train()
-        epoch_loss    = 0.0
+        epoch_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
 
         if HAS_TQDM:
-            bar = tqdm(dataloader, desc=f'Epoch {epoch:2d}/{args.epochs}',
-                       dynamic_ncols=True, leave=False)
+            bar = tqdm(dataloader, desc=f'Epoch {epoch}/{args.epochs}',
+                       leave=False, dynamic_ncols=True)
         else:
             bar = dataloader
+            print(f'\nEpoch {epoch}/{args.epochs}:')
 
-        for acc_step, (seq, com, quan, timp, label) in enumerate(bar):
-            seq   = seq.to(DEVICE,   non_blocking=True)
-            com   = com.to(DEVICE,   non_blocking=True)
-            quan  = quan.to(DEVICE,  non_blocking=True)
-            timp  = timp.to(DEVICE,  non_blocking=True)
-            label = label.to(DEVICE, non_blocking=True)
+        try:
+            for acc_step, (seq, com, quan, timp, label) in enumerate(bar):
+                seq   = seq.to(DEVICE,   non_blocking=True)
+                com   = com.to(DEVICE,   non_blocking=True)
+                quan  = quan.to(DEVICE,  non_blocking=True)
+                timp  = timp.to(DEVICE,  non_blocking=True)
+                label = label.to(DEVICE, non_blocking=True)
 
-            # ── AMP forward ───────────────────────────────────────────
-            with torch.autocast(device_type=DEVICE.type, enabled=use_amp):
-                out  = model(seq, com, quan, timp)
-                loss = criterion(out, label) / args.grad_accum  # normalise
+                if use_amp:
+                    with torch.autocast(device_type='cuda'):
+                        out  = model(seq, com, quan, timp)
+                        loss = criterion(out, label) / args.grad_accum
+                else:
+                    out  = model(seq, com, quan, timp)
+                    loss = criterion(out, label) / args.grad_accum
 
-            scaler.scale(loss).backward()
+                if not torch.isfinite(loss):
+                    print(f'\n[train] WARNING: non-finite loss at step {acc_step}')
+                    print(f'  seq NaN={seq.isnan().any().item()} Inf={seq.isinf().any().item()}')
+                    print(f'  out NaN={out.isnan().any().item()} Inf={out.isinf().any().item()}')
+                    print(f'  label min={label.min().item()} max={label.max().item()} num_keys={num_keys}')
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
-            # ── Gradient accumulation step ────────────────────────────
-            if (acc_step + 1) % args.grad_accum == 0:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
-                global_step += 1
+                loss.backward()
 
-            loss_val   = loss.item() * args.grad_accum
-            epoch_loss += loss_val
+                if (acc_step + 1) % args.grad_accum == 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
-            if HAS_TQDM:
-                lr_now = scheduler.get_last_lr()[0]
-                bar.set_postfix(loss=f'{loss_val:.4f}', lr=f'{lr_now:.2e}',
-                                gpu=f'{torch.cuda.memory_allocated()/1e9:.1f}GB'
-                                    if DEVICE.type == 'cuda' else 'N/A')
+                epoch_loss += loss.item() * args.grad_accum
 
-        # Handle leftover accumulation steps at epoch end
-        if (len(dataloader)) % args.grad_accum != 0:
-            scaler.unscale_(optimizer)
+                if HAS_TQDM:
+                    mem = torch.cuda.memory_allocated() / 1e9 if DEVICE.type == 'cuda' else 0
+                    bar.set_postfix(loss=f'{loss.item()*args.grad_accum:.4f}',
+                                   mem=f'{mem:.1f}GB')
+                elif (acc_step + 1) % 50 == 0:
+                    print(f'  Step {acc_step+1}/{steps_per_epoch}: '
+                          f'loss={loss.item()*args.grad_accum:.4f}')
+
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower():
+                print(f'\n[train] OOM at epoch {epoch}! '
+                      f'Try reducing --batch_size or --hidden_size')
+                raise
+            else:
+                raise
+
+        if steps_per_epoch % args.grad_accum != 0:
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
         avg_loss = epoch_loss / steps_per_epoch
-        lr_now   = scheduler.get_last_lr()[0]
 
-        # GPU memory stats
         if DEVICE.type == 'cuda':
-            allocated = torch.cuda.max_memory_allocated() / 1e9
-            reserved  = torch.cuda.max_memory_reserved()  / 1e9
+            peak_mem = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
-            mem_str = f'  peak_mem={allocated:.2f}/{reserved:.2f}GB'
+            mem_str = f'  peak={peak_mem:.2f}GB'
         else:
             mem_str = ''
 
-        print(f'Epoch [{epoch:2d}/{args.epochs}]  '
-              f'loss={avg_loss:.4f}  lr={lr_now:.2e}  '
+        print(f'Epoch {epoch}/{args.epochs}: loss={avg_loss:.4f}  '
               f'patience={patience_counter}/{args.patience}{mem_str}')
 
-        # ── Evaluate ──────────────────────────────────────────────────
-        res = evaluate_topk(normal_sessions, anomaly_sessions, model,
-                            args.num_candidates, args.anomaly_rate,
-                            batch_size=args.eval_batch_size, use_amp=use_amp)
+        res = evaluate_topk(
+            normal_sessions, anomaly_sessions, model,
+            args.num_candidates, args.anomaly_rate,
+            batch_size = args.eval_batch_size,
+            use_amp    = use_amp,
+            emb_matrix = emb_matrix,
+            num_keys   = num_keys,
+        )
 
-        for k, (acc, ano_prec, ano_rec, f1, fbeta) in res.items():
-            print(f'  TopK={k} | Acc={acc:.3f}  AnoPrec={ano_prec:.3f}  '
-                  f'AnoRec={ano_rec:.3f}  F1={f1:.3f}  F2ano={fbeta:.3f}')
+        for k, (acc, prec, rec, f1, fbeta) in res.items():
+            print(f'  TopK={k}: Acc={acc:.3f} Prec={prec:.3f} '
+                  f'Rec={rec:.3f} F1={f1:.3f} F2={fbeta:.3f}')
 
-        best_k_fbeta = max(v[4] for v in res.values())
-        if best_k_fbeta > best_fbeta:
-            best_fbeta       = best_k_fbeta
-            best_epoch       = epoch
+        best_k = max(v[4] for v in res.values())
+        if best_k > best_fbeta:
+            best_fbeta = best_k
+            best_epoch = epoch
             patience_counter = 0
-            # Unwrap DataParallel / compiled model before saving
-            raw_model = model
-            if isinstance(raw_model, nn.DataParallel):
-                raw_model = raw_model.module
-            if hasattr(raw_model, '_orig_mod'):       # torch.compile wrapper
-                raw_model = raw_model._orig_mod
             torch.save({
-                'model':     raw_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch':     epoch,
+                'model':      model.state_dict(),
+                'optimizer':  optimizer.state_dict(),
+                'epoch':      epoch,
                 'fbeta2_ano': best_fbeta,
-                'args':      vars(args),
-                'emb_dim':   emb_dim,
-                'num_keys':  num_keys,
-                'num_coms':  num_coms,
+                'args':       vars(args),
+                'emb_dim':    emb_dim,
+                'num_keys':   num_keys,
+                'num_coms':   num_coms,
             }, CKPT_PATH)
-            print(f'  [train] ✓ New best F2ano={best_fbeta:.3f}, checkpoint saved.')
+            print(f'  ✓ Best F2={best_fbeta:.3f} saved')
         else:
             patience_counter += 1
 
         if patience_counter >= args.patience:
-            print(f'\n[train] Early stopping (no improvement for {args.patience} epochs)')
+            print(f'\nEarly stop (no improvement for {args.patience} epochs)')
             break
 
-    print(f'\n[train] Best epoch: {best_epoch}  Best F2ano: {best_fbeta:.3f}')
-    print(f'[train] Checkpoint: {CKPT_PATH}')
+    print(f'\nBest: epoch {best_epoch}, F2={best_fbeta:.3f}')
+    print(f'Saved: {CKPT_PATH}')
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Train CSCLog – max GPU utilization')
+    p = argparse.ArgumentParser()
     p.add_argument('--window_size',     type=int,   default=DEFAULTS['window_size'])
     p.add_argument('--batch_size',      type=int,   default=DEFAULTS['batch_size'])
-    p.add_argument('--grad_accum',      type=int,   default=DEFAULTS['grad_accum'],
-                   help='Gradient accumulation steps (effective_batch = batch×grad_accum)')
+    p.add_argument('--grad_accum',      type=int,   default=DEFAULTS['grad_accum'])
     p.add_argument('--epochs',          type=int,   default=DEFAULTS['epochs'])
     p.add_argument('--lr',              type=float, default=DEFAULTS['lr'])
     p.add_argument('--warmup_epochs',   type=int,   default=DEFAULTS['warmup_epochs'])
@@ -584,16 +594,13 @@ def parse_args():
     p.add_argument('--alpha',           type=float, default=DEFAULTS['alpha'])
     p.add_argument('--pattern',         type=int,   default=DEFAULTS['pattern'])
     p.add_argument('--num_layers',      type=int,   default=DEFAULTS['num_layers'])
-    p.add_argument('--anomaly_rate',    type=int,   default=DEFAULTS['anomaly_rate'])
     p.add_argument('--patience',        type=int,   default=DEFAULTS['patience'])
     p.add_argument('--eval_batch_size', type=int,   default=DEFAULTS['eval_batch_size'])
     p.add_argument('--hidden_size',     type=int,   nargs=5,
-                   default=DEFAULTS['hidden_size'],
-                   metavar=('FT', 'LSTM', 'MLP', 'GCN', 'OUT'))
+                   default=DEFAULTS['hidden_size'])
     p.add_argument('--num_candidates',  type=int,   nargs='+',
                    default=DEFAULTS['num_candidates'])
-    p.add_argument('--compile', dest='compile_model', action='store_true',
-                   help='Use torch.compile for 20-40%% faster training (PyTorch 2.0+)')
+    p.add_argument('--anomaly_rate',    type=int,   default=DEFAULTS['anomaly_rate'])
     return p.parse_args()
 
 

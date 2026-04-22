@@ -1,27 +1,9 @@
-"""
-CSCLog model – MAXIMUM GPU UTILIZATION VERSION
-================================================
-Optimizations vs previous version:
-  1. Fully batched GCN:  build ONE global graph per mini-batch instead of
-     B sequential per-sample GCN calls. Edge weights are computed with a
-     single matrix multiply (no Python loop over samples).
-  2. Attention pool:     pre-fused into one bmm+softmax, no view overhead.
-  3. Component LSTM:     already batched (kept from previous version).
-  4. Remove all .item() and CPU syncs from forward().
-  5. All temporary tensors created directly on the correct device.
-  6. Supports torch.compile (no data-dependent Python control flow in hot path).
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
 from torch_geometric.nn import GCNConv
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sub-modules
-# ─────────────────────────────────────────────────────────────────────────────
 
 class MLPLayer(nn.Module):
     def __init__(self, dmodel, hid_size, drop):
@@ -37,7 +19,6 @@ class MLPLayer(nn.Module):
 
 
 class FTEncoder(nn.Module):
-    """Fuse template embedding + time delta → fixed-size vector."""
     def __init__(self, sen_size, hidden_size, alpha=0.5, pattern=0):
         super().__init__()
         self.pattern = pattern
@@ -55,7 +36,6 @@ class FTEncoder(nn.Module):
             self.time_fc = nn.Linear(1, hidden_size)
 
     def forward(self, sen_x, time_x):
-        # time_x: (B, W) → (B, W, 1)
         t = time_x.unsqueeze(-1)
         if self.pattern == 0:
             return self.cat_fc(torch.cat([sen_x, t], dim=-1))
@@ -80,18 +60,14 @@ class LSTMEncoder(nn.Module):
         return out[:, -1, :]
 
     def forward_packed(self, packed, N):
-        """Run on a PackedSequence of N total sequences."""
-        h0 = torch.zeros(self.num_layers, N, self.hidden_size,
-                         device=next(self.parameters()).device)
-        _, (h_n, _) = self.lstm(packed, (h0, torch.zeros_like(h0)))
-        return h_n[-1]   # (N, hidden_size)
+        device = next(self.parameters()).device
+        h0 = torch.zeros(self.num_layers, N, self.hidden_size, device=device)
+        c0 = torch.zeros(self.num_layers, N, self.hidden_size, device=device)
+        _, (h_n, _) = self.lstm(packed, (h0, c0))
+        return h_n[-1]
 
 
 class IREncoder(nn.Module):
-    """
-    Inter-component Relation encoder.
-    OPTIMIZED: builds edge tensors without Python list loops in the forward path.
-    """
     def __init__(self, dmodel, mlp_hid_size, gcn_hid_size, drop, com_num):
         super().__init__()
         self.dmodel  = dmodel
@@ -100,73 +76,37 @@ class IREncoder(nn.Module):
 
         self.edge_mlp = MLPLayer(2 * dmodel, mlp_hid_size, drop)
         self.mlp_out  = nn.Linear(mlp_hid_size, 1)
-        self.GCN0     = GCNConv(dmodel, gcn_hid_size)
-        self.GCN1     = GCNConv(gcn_hid_size, dmodel)
-
-    @staticmethod
-    def _build_edge_index_fast(node_indices: torch.Tensor):
-        """
-        Build complete undirected edge index for `node_indices` using
-        torch operations — no Python loops, stays on the same device.
-        node_indices: 1-D tensor of node ids, shape (K,)
-        returns: (2, K*(K-1)//2) edge_index
-        """
-        K = node_indices.shape[0]
-        if K <= 1:
-            return node_indices.new_empty((2, 0))
-        # upper-triangular pairs
-        r = torch.arange(K, device=node_indices.device)
-        i, j = torch.triu_indices(K, K, offset=1, device=node_indices.device)
-        src = node_indices[i]
-        dst = node_indices[j]
-        return torch.stack([src, dst], dim=0)  # (2, E)
-
-    def _gumbel_softmax(self, x, dim=0):
-        return F.softmax(x.transpose(dim, 0), dim=0).transpose(dim, 0)
+        # add_self_loops=True ensures every node has degree >= 1 -> no 1/sqrt(0) NaN
+        self.GCN0     = GCNConv(dmodel, gcn_hid_size, add_self_loops=True)
+        self.GCN1     = GCNConv(gcn_hid_size, dmodel, add_self_loops=True)
 
     def forward(self, x: torch.Tensor, index: torch.Tensor):
-        """
-        x     : (K, dmodel)  — component representations
-        index : (K,)         — global component ids (long tensor)
-        """
-        device = x.device
         K = x.shape[0]
-
-        # Zero-padded global node table
-        padding = x.new_zeros(self.com_num, self.dmodel)
-        padding[index] = x
-
-        edge_index = self._build_edge_index_fast(index)  # (2, E)
-        if edge_index.shape[1] == 0:
-            # Single component — skip GCN, return x unchanged
+        if K <= 1:
             return x
 
-        # Edge features: concat node pairs
-        edge_x = torch.cat([padding[edge_index[0]], padding[edge_index[1]]], dim=-1)
-        edge_x = self.edge_mlp(edge_x)       # (E, mlp_hid)
-        edge_w = self._gumbel_softmax(self.mlp_out(edge_x), dim=0)  # (E, 1)
+        # LOCAL indices 0..K-1 — GCNConv only sees K nodes, all connected
+        # This is the root fix: previous code passed com_num-sized padding
+        # where most nodes had degree=0 -> 1/sqrt(0) = NaN in GCN normalization
+        local_i, local_j = torch.triu_indices(K, K, offset=1, device=x.device)
+        edge_index = torch.stack([
+            torch.cat([local_i, local_j]),
+            torch.cat([local_j, local_i])
+        ], dim=0)  # (2, K*(K-1))
 
-        out = F.relu(self.GCN0(padding, edge_index, edge_w))
+        src_feat = x[edge_index[0]]
+        dst_feat = x[edge_index[1]]
+        edge_x   = torch.cat([src_feat, dst_feat], dim=-1)
+        edge_x   = self.edge_mlp(edge_x)
+        edge_w   = torch.sigmoid(self.mlp_out(edge_x)).clamp(min=1e-6, max=1.0)
+
+        out = F.relu(self.GCN0(x, edge_index, edge_w))
         out = F.dropout(out, self.drop, training=self.training)
         out = self.GCN1(out, edge_index, edge_w)
-        return out[index]   # (K, dmodel)
+        return out  # (K, dmodel)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main model
-# ─────────────────────────────────────────────────────────────────────────────
 
 class CSCLog(nn.Module):
-    """
-    CSCLog – Maximum GPU Utilization
-
-    Key changes vs previous:
-    • FTEncoder takes (x, t) separately — avoids tuple overhead
-    • Component LSTM: ONE batched PackedSequence forward for all samples
-    • IREncoder: fully tensor-based edge construction (no Python loops)
-    • Attention pool: single bmm, no reshape gymnastics
-    • No .item() / .cpu() calls anywhere in forward()
-    """
     def __init__(self, input_size, com_num, hidden_size, alpha, pattern,
                  num_layers, num_keys, drop=0.1):
         super().__init__()
@@ -188,99 +128,65 @@ class CSCLog(nn.Module):
         nn.init.xavier_uniform_(self.u_att.unsqueeze(0),
                                 gain=nn.init.calculate_gain('relu'))
 
-    # ── Attention pool ────────────────────────────────────────────────────
     def _attention_pool(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, T, H)  →  (B, H)
-        Single bmm call, no Python reshaping.
-        """
-        # scores: (B, T, 1)
         scores  = torch.bmm(x, self.u_att.unsqueeze(0).expand(x.size(0), -1, -1))
-        weights = F.softmax(scores, dim=1)          # (B, T, 1)
-        pooled  = (x * weights).sum(dim=1)          # (B, H)
+        scores  = scores.clamp(-30.0, 30.0)
+        weights = F.softmax(scores, dim=1)
+        pooled  = (x * weights).sum(dim=1)
         return F.relu(self.att_fc(pooled))
 
-    # ── Forward ───────────────────────────────────────────────────────────
     def forward(self, x: torch.Tensor, index: torch.Tensor,
                 _q_x: torch.Tensor, t_x: torch.Tensor) -> torch.Tensor:
-        """
-        x     : (B, W, emb_dim)
-        index : (B, W)  component indices (long)
-        _q_x  : (B, num_keys) quantity pattern — unused (kept for API compat)
-        t_x   : (B, W)  time deltas
-        """
         B, W, _ = x.shape
 
-        # (a) Fuse embeddings + time
-        x = self.ftencoder(x, t_x)   # (B, W, ft_hid)
+        index = index.clamp(0, self.com_num - 1)
 
-        # (b) Sequence-level LSTM
-        seq_out = self.lstm_seq(x)    # (B, lstm_hid)
+        x = self.ftencoder(x, t_x)
+        seq_out = self.lstm_seq(x)
 
-        # ── (c) Component LSTM — single batched forward ────────────────
-        #
-        # Strategy:
-        #   For each sample i, group window positions by component id.
-        #   Collect ALL subsequences across the batch into one padded tensor.
-        #   Run ONE PackedSequence LSTM forward.
-        #   Scatter results back to per-sample component slots.
-        #
-        # CPU work here is O(B*W) list ops — done ONCE per batch,
-        # not per epoch × per batch.
-        # ──────────────────────────────────────────────────────────────
-
-        index_cpu = index.cpu().tolist()   # (B, W) — one D2H per batch
-
-        all_subseqs  = []    # list of (L_k, ft_hid) tensors
-        all_lengths  = []    # L_k values
-        # For each sample i: list of (com_id, flat_idx_in_all_subseqs)
+        index_cpu    = index.cpu().tolist()
+        all_subseqs  = []
+        all_lengths  = []
         batch_com_maps = []
 
         for i in range(B):
-            positions_by_com: dict[int, list[int]] = {}
+            positions_by_com: dict = {}
             for j, cid in enumerate(index_cpu[i]):
                 positions_by_com.setdefault(cid, []).append(j)
 
-            com_map: dict[int, int] = {}
+            com_map: dict = {}
             for cid, positions in positions_by_com.items():
-                # x[i, positions] — fancy index, no copy (stays on GPU)
                 all_subseqs.append(x[i, positions, :])
                 all_lengths.append(len(positions))
                 com_map[cid] = len(all_subseqs) - 1
             batch_com_maps.append(com_map)
 
-        # Pad all subsequences
         N       = len(all_subseqs)
         max_len = max(all_lengths)
         ft_hid  = x.shape[-1]
 
-        # Allocate padded buffer
         padded = x.new_zeros(N, max_len, ft_hid)
         for k, (seq_k, L_k) in enumerate(zip(all_subseqs, all_lengths)):
             padded[k, :L_k] = seq_k
 
-        # ONE PackedSequence LSTM call (all N subsequences in parallel)
-        lengths_t = torch.tensor(all_lengths, dtype=torch.long)  # CPU — needed by pack
-        packed    = rnn_utils.pack_padded_sequence(
+        lengths_t    = torch.tensor(all_lengths, dtype=torch.long)
+        packed       = rnn_utils.pack_padded_sequence(
             padded, lengths_t, batch_first=True, enforce_sorted=False)
-        lstm_com_out = self.lstm_com.forward_packed(packed, N)  # (N, lstm_hid)
+        lstm_com_out = self.lstm_com.forward_packed(packed, N)
 
-        # ── (d) Per-sample GCN + attention ────────────────────────────
         com_outs = []
         for i in range(B):
             com_map   = batch_com_maps[i]
-            flat_idxs = list(com_map.values())           # small list, O(n_coms)
-            ac        = lstm_com_out[flat_idxs]          # (K, lstm_hid)
-            idx_t     = index.new_tensor(list(com_map.keys()))  # (K,) — on DEVICE
+            flat_idxs = list(com_map.values())
+            ac        = lstm_com_out[flat_idxs]
+            idx_t     = index.new_tensor(list(com_map.keys()))
 
             if ac.shape[0] > 1:
                 ac = self.irencoder(ac, idx_t)
 
-            # Attention pool over K components
-            com_outs.append(self._attention_pool(ac.unsqueeze(0)))  # (1, lstm_hid)
+            com_outs.append(self._attention_pool(ac.unsqueeze(0)))
 
-        com_out = torch.cat(com_outs, dim=0)   # (B, lstm_hid)  — cat avoids squeeze
+        com_out = torch.cat(com_outs, dim=0)
 
-        # (e) Classification head
         out = F.relu(self.fc1(torch.cat([seq_out, com_out], dim=-1)))
         return self.fc2(out)
