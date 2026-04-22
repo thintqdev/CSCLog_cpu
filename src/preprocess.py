@@ -1,23 +1,21 @@
 """
-Step 2: Preprocess structured Linux log into:
-  1. Sentence embeddings (BERT-based TF-IDF weighted)     → _sentences_emb.json
-  2. Component index mapping                               → _component.json
-  3. Session-windowed train / test CSV files               → train_normal.csv,
-                                                             test_normal.csv,
-                                                             test_anomaly.csv
-
-Linux.log has no ground-truth anomaly labels, so we treat every session as
-normal during training.  A heuristic is applied to mark rare sessions as
-anomalous for testing purposes so the full evaluation pipeline can run.
-
-Run AFTER parse_logs.py.
+Step 2: Preprocess structured log → embeddings + sessions.
+===========================================================
+Optimizations vs previous version:
+  1. BERT word_vec: batched tokenization + GPU inference (was 1 word at a time)
+  2. build_sessions: fully vectorized with pandas (was iterrows over 4M rows)
+     - pd.to_datetime once, vectorized diff, np.searchsorted for boundaries
+  3. dateutil.parse removed from hot path entirely
+  4. feature_select: numpy-accelerated TF-IDF matrix (was pure Python dicts)
+  5. tqdm progress bars throughout
+  6. BERT moved to GPU automatically if available
+  7. Larger BERT batch size (128 words per forward pass)
 """
 
 import sys
 import os
 import json
 import math
-import operator
 import re
 from collections import defaultdict
 
@@ -26,115 +24,157 @@ import pandas as pd
 import torch
 from transformers import AutoTokenizer, BertModel
 
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, PROJECT_ROOT)
 
-# ── Paths ────────────────────────────────────────────────────────────────────
-RESULT_DIR  = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
-OUTPUT_DIR  = RESULT_DIR                                  # same folder
-MODEL_PATH      = os.path.join(PROJECT_ROOT, 'model', 'bert')
-BERT_HF_NAME    = 'bert-base-uncased'
-_WEIGHT_FILES   = ('pytorch_model.bin', 'model.safetensors')
+# ── Paths ─────────────────────────────────────────────────────────────────────
+RESULT_DIR     = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
+OUTPUT_DIR     = RESULT_DIR
+MODEL_PATH     = os.path.join(PROJECT_ROOT, 'model', 'bert')
+BERT_HF_NAME   = 'bert-base-uncased'
+_WEIGHT_FILES  = ('pytorch_model.bin', 'model.safetensors')
 
 STRUCTURED_CSV = os.path.join(RESULT_DIR, 'data_full_structured.csv')
 TEMPLATES_CSV  = os.path.join(RESULT_DIR, 'data_full_templates.csv')
+EMB_OUTPUT     = os.path.join(OUTPUT_DIR, 'data_full_sentences_emb.json')
+COM_OUTPUT     = os.path.join(OUTPUT_DIR, 'data_full_component.json')
+TRAIN_CSV      = os.path.join(OUTPUT_DIR, 'train_normal.csv')
+VAL_NOR_CSV    = os.path.join(OUTPUT_DIR, 'test_normal.csv')
+VAL_ANO_CSV    = os.path.join(OUTPUT_DIR, 'test_anomaly.csv')
 
-EMB_OUTPUT  = os.path.join(OUTPUT_DIR, 'data_full_sentences_emb.json')
-COM_OUTPUT  = os.path.join(OUTPUT_DIR, 'data_full_component.json')
-TRAIN_CSV   = os.path.join(OUTPUT_DIR, 'train_normal.csv')
-VAL_NOR_CSV = os.path.join(OUTPUT_DIR, 'test_normal.csv')
-VAL_ANO_CSV = os.path.join(OUTPUT_DIR, 'test_anomaly.csv')
+# ── Hyper-params ──────────────────────────────────────────────────────────────
+WINDOW_SIZE    = 9
+TRAIN_RATIO    = 0.7
+GAP_SECONDS    = 60          # session boundary gap
+BERT_BATCH     = 128         # words per BERT forward pass
+ANOMALY_LEVELS = {'error', 'critical', 'err', 'crit', 'fatal', 'alert', 'emerg'}
 
-# ── Hyper-params ─────────────────────────────────────────────────────────────
-WINDOW_SIZE        = 9      # must match train.py
-TRAIN_RATIO        = 0.7
-# Log levels that indicate an anomalous event
-ANOMALY_LEVELS     = {'error', 'critical', 'err', 'crit', 'fatal', 'alert', 'emerg'}
-
+# ── Device ────────────────────────────────────────────────────────────────────
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'[preprocess] Device: {DEVICE}')
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Embedding helpers (from utils/sentence_embding.py)
+# 1. Text helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 STOPWORDS = {'in', 'on', 'with', 'by', 'for', 'at', 'about', 'under', 'of', 'to', 'from'}
+_CLEAN_RE = re.compile(r'[^\w\u4e00-\u9fff]+')
 
 
-def get_keys(sentence) -> list:
+def get_keys(sentence: str) -> list[str]:
     if not isinstance(sentence, str) or not sentence.strip():
         return []
-    line = sentence.lower()
-    line = re.sub(r'[^\w\u4e00-\u9fff]+', ' ', line)
-    return [x for x in line.split() if x not in STOPWORDS]
+    return [x for x in _CLEAN_RE.sub(' ', sentence.lower()).split()
+            if x not in STOPWORDS]
 
 
-def feature_select(list_words):
-    doc_frequency = defaultdict(int)
-    for word_list in list_words:
-        for w in word_list:
-            doc_frequency[w] += 1
+def feature_select(list_words: list[list[str]]) -> list[tuple[str, float]]:
+    """Vectorized TF-IDF using numpy instead of Python dicts."""
+    # Vocabulary
+    all_words = sorted({w for wl in list_words for w in wl})
+    w2i       = {w: i for i, w in enumerate(all_words)}
+    V, D      = len(all_words), len(list_words)
 
-    total = sum(doc_frequency.values())
-    word_tf = {w: doc_frequency[w] / total for w in doc_frequency}
+    if V == 0 or D == 0:
+        return []
 
-    doc_num = len(list_words)
-    word_doc = defaultdict(int)
-    for w in doc_frequency:
-        for wl in list_words:
-            if w in wl:
-                word_doc[w] += 1
-    word_idf = {w: math.log(doc_num / (word_doc[w] + 1)) for w in doc_frequency}
+    # Term frequency (global)
+    counts = np.zeros(V, dtype=np.float32)
+    for wl in list_words:
+        for w in wl:
+            counts[w2i[w]] += 1
+    tf = counts / counts.sum()
 
-    word_tfidf = {w: word_tf[w] * word_idf[w] for w in doc_frequency}
-    return sorted(word_tfidf.items(), key=operator.itemgetter(1), reverse=True)
+    # Document frequency
+    doc_freq = np.zeros(V, dtype=np.float32)
+    for wl in list_words:
+        seen = set(wl)
+        for w in seen:
+            doc_freq[w2i[w]] += 1
+    idf = np.log(D / (doc_freq + 1))
 
-
-def word_vec(keys, tokenizer, model):
-    encode_keys = {}
-    model.eval()
-    with torch.no_grad():
-        for word, weight in keys:
-            encoded = tokenizer(word, return_tensors='pt')
-            out = model(**encoded)
-            encode_keys[word] = torch.mul(
-                out[0].mean(dim=1, keepdim=False)[0], weight
-            )
-    return encode_keys
-
-
-def sentence_vec(sentences: dict, keys, tokenizer, model) -> dict:
-    encode_keys = word_vec(keys, tokenizer, model)
-    first_ = list(encode_keys.values())[0]
-    encode_sentence = {}
-    for event_id, word_list in sentences.items():
-        vec = torch.zeros_like(first_)
-        for w in word_list:
-            if w in encode_keys:
-                vec += encode_keys[w]
-        encode_sentence[event_id] = vec.tolist()
-    return encode_sentence
+    tfidf = tf * idf
+    order = np.argsort(tfidf)[::-1]
+    return [(all_words[i], float(tfidf[i])) for i in order]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Build sentence embeddings
+# 2. Batched BERT embedding (GPU)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bert_path() -> str:
-    """Return local MODEL_PATH if weights are present, else download from HF Hub."""
     if any(os.path.exists(os.path.join(MODEL_PATH, f)) for f in _WEIGHT_FILES):
+        print(f'[preprocess] Loading BERT from local path: {MODEL_PATH}')
         return MODEL_PATH
-    
-    # Option to download locally first
-    print(f'[preprocess] Weights not found in {MODEL_PATH}')
-    print(f'[preprocess] Option 1: Download locally using wget (offline)')
-    print(f'  mkdir -p {MODEL_PATH}')
-    print(f'  cd {MODEL_PATH}')
-    print(f'  wget https://huggingface.co/google-bert/bert-base-uncased/resolve/main/pytorch_model.bin')
-    print(f'  wget https://huggingface.co/google-bert/bert-base-uncased/resolve/main/config.json')
-    print(f'  wget https://huggingface.co/google-bert/bert-base-uncased/resolve/main/vocab.txt')
-    print(f'\nOption 2: Download from HuggingFace Hub (online)')
-    print(f'  This requires PyTorch >= 2.4')
-    print(f'\nAttempting to download from HuggingFace Hub...')
+    print(f'[preprocess] BERT weights not found locally, downloading from HuggingFace …')
     return BERT_HF_NAME
+
+
+def word_vec_batched(keys: list[tuple[str, float]],
+                     tokenizer, model, batch_size: int = BERT_BATCH) -> dict:
+    """
+    Encode all (word, weight) pairs in batches on GPU.
+    Returns {word: weighted_embedding_tensor} (tensors on CPU).
+    """
+    model.eval()
+    words   = [w for w, _ in keys]
+    weights = [wt for _, wt in keys]
+    result  = {}
+
+    bar = tqdm(range(0, len(words), batch_size), desc='  BERT batches',
+               unit='batch') if HAS_TQDM else range(0, len(words), batch_size)
+
+    with torch.no_grad():
+        for start in bar:
+            batch_words = words[start: start + batch_size]
+            batch_wts   = weights[start: start + batch_size]
+
+            encoded = tokenizer(
+                batch_words, return_tensors='pt',
+                padding=True, truncation=True, max_length=32
+            )
+            encoded = {k: v.to(DEVICE) for k, v in encoded.items()}
+            out     = model(**encoded)                    # last_hidden_state: (B, L, H)
+            # Mean pool over token dim → (B, H), then weight by TF-IDF score
+            vecs    = out.last_hidden_state.mean(dim=1)   # (B, H)
+
+            for i, (word, wt) in enumerate(zip(batch_words, batch_wts)):
+                result[word] = (vecs[i] * wt).cpu()
+
+    return result
+
+
+def sentence_vec_batched(sentences: dict, keys: list[tuple[str, float]],
+                         tokenizer, model) -> dict:
+    """Aggregate word vectors into sentence vectors (vectorized)."""
+    encode_keys = word_vec_batched(keys, tokenizer, model)
+
+    # Stack all word vectors into a matrix for fast lookup
+    vocab_words  = list(encode_keys.keys())
+    vocab_matrix = torch.stack([encode_keys[w] for w in vocab_words])  # (V, H)
+    w2i          = {w: i for i, w in enumerate(vocab_words)}
+
+    emb_dim  = vocab_matrix.shape[1]
+    result   = {}
+
+    bar = tqdm(sentences.items(), desc='  sentence vecs',
+               total=len(sentences), unit='template') if HAS_TQDM else sentences.items()
+
+    for event_id, word_list in bar:
+        idxs = [w2i[w] for w in word_list if w in w2i]
+        if idxs:
+            vec = vocab_matrix[idxs].sum(dim=0)   # sum of TF-IDF weighted vecs
+        else:
+            vec = torch.zeros(emb_dim)
+        result[event_id] = vec.tolist()
+
+    return result
 
 
 def build_embeddings():
@@ -142,19 +182,26 @@ def build_embeddings():
     templates = pd.read_csv(TEMPLATES_CSV)
 
     sentences = {
-        row['EventId']: get_keys(row['EventTemplate'])
+        row['EventId']: get_keys(str(row['EventTemplate']))
         for _, row in templates.iterrows()
         if isinstance(row['EventId'], str) and row['EventId']
     }
-    # Drop entries that produced no tokens (avoids downstream divide-by-zero)
     sentences = {k: v for k, v in sentences.items() if v}
-    keys = feature_select(list(sentences.values()))
+    print(f'[preprocess] Templates with tokens: {len(sentences):,}')
 
-    tokenizer = AutoTokenizer.from_pretrained(_bert_path())
-    bert = BertModel.from_pretrained(_bert_path())
+    keys = feature_select(list(sentences.values()))
+    print(f'[preprocess] Vocabulary size: {len(keys):,}')
+
+    bert_path = _bert_path()
+    tokenizer = AutoTokenizer.from_pretrained(bert_path)
+    bert      = BertModel.from_pretrained(bert_path).to(DEVICE)
     bert.eval()
 
-    emb = sentence_vec(sentences, keys, tokenizer, bert)
+    if DEVICE.type == 'cuda':
+        print(f'[preprocess] BERT on GPU: {torch.cuda.get_device_name(0)}')
+
+    emb = sentence_vec_batched(sentences, keys, tokenizer, bert)
+
     with open(EMB_OUTPUT, 'w') as f:
         json.dump(emb, f)
     print(f'[preprocess] Embeddings saved → {EMB_OUTPUT}')
@@ -162,107 +209,110 @@ def build_embeddings():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Build component index
+# 3. Component map
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_component_map(structured: pd.DataFrame) -> dict:
     print('[preprocess] Building component map …')
-    components = structured['Component'].dropna().unique().tolist()
-    # strip trailing colon / version noise
-    components = list({c.split('[')[0].split(':')[0].strip() for c in components})
-    com_map = {c: i for i, c in enumerate(sorted(components))}
+    # Vectorized component normalization
+    components = (structured['Component']
+                  .dropna()
+                  .astype(str)
+                  .str.split('[').str[0]
+                  .str.split(':').str[0]
+                  .str.strip()
+                  .unique())
+    com_map = {c: i for i, c in enumerate(sorted(set(components)))}
     with open(COM_OUTPUT, 'w') as f:
         json.dump(com_map, f)
-    print(f'[preprocess] Component map saved → {COM_OUTPUT}  ({len(com_map)} components)')
+    print(f'[preprocess] Component map: {len(com_map)} components → {COM_OUTPUT}')
     return com_map
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Build sessions and split train / test
-#
-# Linux.log is a single contiguous syslog file; we group by Host+Component
-# bursts separated by >60 s as "sessions".  Each session row is stored as
-# EventSequence  =  list of (EventId, component_key, ISO-timestamp) tuples.
+# 4. Build sessions — fully vectorized (no iterrows)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_sessions(structured: pd.DataFrame, com_map: dict, gap_seconds: int = 60):
+def build_sessions(structured: pd.DataFrame, com_map: dict) -> list:
     """
-    Group consecutive log lines that belong to the same component-host pair
-    within `gap_seconds` into one session.
-    Returns a list of sessions; each session is a list of
-    (EventId, component_key, iso_timestamp).
+    Vectorized session building using pandas.
+    Avoids iterrows() over 4M rows — processes entire DataFrame at once.
+
+    Session boundary: gap between consecutive timestamps > GAP_SECONDS.
+    Returns list of (session_events, is_anomalous).
     """
-    # iso_time column is already present (written by parse_logs.py from @timestamp)
-    structured = structured.copy()
+    print('[preprocess] Building sessions (vectorized) …')
+    df = structured.copy()
 
-    # Normalise component key to match com_map
-    def norm_com(c):
-        key = str(c).split('[')[0].split(':')[0].strip()
-        return key if key in com_map else list(com_map.keys())[0]
+    # Normalize component key (vectorized)
+    fallback_com = sorted(com_map.keys())[0]
+    raw_com = (df['Component']
+               .fillna('')
+               .astype(str)
+               .str.split('[').str[0]
+               .str.split(':').str[0]
+               .str.strip())
+    df['com_key'] = raw_com.where(raw_com.isin(com_map), fallback_com)
 
-    structured['com_key'] = structured['Component'].apply(norm_com)
+    # Parse timestamps vectorized — much faster than dateutil in a loop
+    print('[preprocess]   Parsing timestamps …')
+    df['ts'] = pd.to_datetime(df['iso_time'], errors='coerce', utc=False)
+    # Fill NaT with a safe default
+    df['ts'] = df['ts'].fillna(pd.Timestamp('2000-01-01'))
 
-    sessions      = []
-    current_session = []
-    current_has_anomaly = False
-    prev_ts = None
+    # Anomaly flag per row (vectorized)
+    df['is_ano'] = df['Level'].fillna('').str.lower().str.strip().isin(ANOMALY_LEVELS)
 
-    from dateutil.parser import parse as dtparse
-    for _, row in structured.iterrows():
-        ts = row['iso_time']
-        # detect session boundary: gap > gap_seconds or missing event
-        if prev_ts is not None:
-            try:
-                delta = (dtparse(ts) - dtparse(prev_ts)).seconds
-            except Exception:
-                delta = 0
-            if delta > gap_seconds:
-                if len(current_session) > WINDOW_SIZE:
-                    sessions.append((current_session, current_has_anomaly))
-                current_session = []
-                current_has_anomaly = False
+    # Session boundary detection
+    # A new session starts where: gap > GAP_SECONDS OR first row
+    ts_series = df['ts']
+    diff_secs = ts_series.diff().dt.total_seconds().fillna(0)
+    new_session = (diff_secs > GAP_SECONDS)
+    session_ids = new_session.cumsum()  # integer session id per row
 
-        level = str(row.get('Level', '')).lower().strip()
-        if level in ANOMALY_LEVELS:
-            current_has_anomaly = True
+    print(f'[preprocess]   Detected {session_ids.max() + 1:,} raw session boundaries …')
 
-        current_session.append((row['EventId'], row['com_key'], ts))
-        prev_ts = ts
+    # Aggregate sessions
+    df['session_id'] = session_ids
 
-    if len(current_session) > WINDOW_SIZE:
-        sessions.append((current_session, current_has_anomaly))
+    # Build event tuples: (EventId, com_key, iso_time_str)
+    # Keep iso_time as string to match downstream expectation
+    df['event_tuple'] = list(zip(df['EventId'], df['com_key'], df['iso_time']))
 
-    n_anomaly = sum(1 for _, is_ano in sessions if is_ano)
-    print(f'[preprocess] Total sessions: {len(sessions)}  '
-          f'(anomalous by level: {n_anomaly}, '
-          f'normal: {len(sessions) - n_anomaly})')
+    sessions = []
+    bar = (tqdm(df.groupby('session_id', sort=False),
+                desc='  grouping sessions', unit='session')
+           if HAS_TQDM
+           else df.groupby('session_id', sort=False))
+
+    for _, grp in bar:
+        if len(grp) <= WINDOW_SIZE:
+            continue
+        event_list = grp['event_tuple'].tolist()
+        is_anomaly = grp['is_ano'].any()
+        sessions.append((event_list, bool(is_anomaly)))
+
+    n_ano = sum(1 for _, a in sessions if a)
+    print(f'[preprocess] Sessions: {len(sessions):,}  '
+          f'(anomalous={n_ano:,}, normal={len(sessions)-n_ano:,})')
     return sessions
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Split and save
+# ─────────────────────────────────────────────────────────────────────────────
+
 def split_and_save(sessions: list):
-    """
-    Split sessions into train_normal, test_normal, test_anomaly.
-
-    Anomaly label: a session is anomalous if it contains at least one log
-    line whose Level is ERROR, CRITICAL, or equivalent (see ANOMALY_LEVELS).
-    This is semantically correct for operational log data.
-
-    Split strategy:
-      - Training: first TRAIN_RATIO of *normal* sessions only
-        (CSCLog is trained on normal behaviour exclusively)
-      - Test normal:  remaining normal sessions
-      - Test anomaly: all anomalous sessions (any split position)
-    """
     normal_sessions  = [s for s, is_ano in sessions if not is_ano]
     anomaly_sessions = [s for s, is_ano in sessions if is_ano]
 
-    n_train = int(len(normal_sessions) * TRAIN_RATIO)
+    n_train        = int(len(normal_sessions) * TRAIN_RATIO)
     train_sessions = normal_sessions[:n_train]
     test_normal    = normal_sessions[n_train:]
     test_anomaly   = anomaly_sessions
 
     def to_df(session_list):
-        return pd.DataFrame([{'EventSequence': str(s)} for s in session_list])
+        return pd.DataFrame({'EventSequence': [str(s) for s in session_list]})
 
     to_df(train_sessions).to_csv(TRAIN_CSV,   index=False)
     to_df(test_normal).to_csv(VAL_NOR_CSV,    index=False)
@@ -270,10 +320,10 @@ def split_and_save(sessions: list):
 
     total_test = len(test_normal) + len(test_anomaly)
     ratio = len(test_anomaly) / total_test if total_test else 0
-    print(f'[preprocess] train_normal:  {len(train_sessions)} sessions → {TRAIN_CSV}')
-    print(f'[preprocess] test_normal:   {len(test_normal)} sessions → {VAL_NOR_CSV}')
-    print(f'[preprocess] test_anomaly:  {len(test_anomaly)} sessions → {VAL_ANO_CSV}')
-    print(f'[preprocess] Test anomaly ratio: {ratio:.1%}')
+    print(f'[preprocess] train_normal : {len(train_sessions):,} → {TRAIN_CSV}')
+    print(f'[preprocess] test_normal  : {len(test_normal):,}    → {VAL_NOR_CSV}')
+    print(f'[preprocess] test_anomaly : {len(test_anomaly):,}   → {VAL_ANO_CSV}')
+    print(f'[preprocess] Anomaly ratio in test: {ratio:.1%}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,16 +333,17 @@ def split_and_save(sessions: list):
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 1. Sentence embeddings
+    # 1. Embeddings (GPU-accelerated BERT)
     if not os.path.exists(EMB_OUTPUT):
         build_embeddings()
     else:
-        print(f'[preprocess] Embeddings already exist, skipping. ({EMB_OUTPUT})')
+        print(f'[preprocess] Embeddings exist, skipping. ({EMB_OUTPUT})')
 
     # 2. Load structured log
-    print('[preprocess] Loading structured log …')
-    structured = pd.read_csv(STRUCTURED_CSV)
-    print(f'[preprocess] Loaded {len(structured)} log lines.')
+    print('[preprocess] Loading structured CSV …')
+    structured = pd.read_csv(STRUCTURED_CSV, engine='c',
+                             na_filter=False, memory_map=True)
+    print(f'[preprocess] Loaded {len(structured):,} log lines.')
 
     # 3. Component map
     com_map = build_component_map(structured)
