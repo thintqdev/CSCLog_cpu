@@ -127,91 +127,87 @@ def _safe_eval(s):
 
 class _TrainDataset(Dataset):
     """
-    Pre-computes ALL tensors at init time so __getitem__ is a single
-    numpy/torch slice — no Python loops, no dict lookups, no dateutil calls
-    inside the training loop.
+    Lazy dataset — stores only compact per-event arrays and an index.
+    Windows are computed on-demand in __getitem__ so that RAM usage is
+    O(total_events × 3 floats) instead of O(total_windows × W × emb_dim).
 
-    Memory layout (contiguous arrays for cache-friendly access):
-      seq_arr  : (N, W, emb_dim)  float32
-      com_arr  : (N, W)           int32
-      qp_arr   : (N, num_keys)    float32
-      tm_arr   : (N, W)           float32
-      lbl_arr  : (N,)             int64
+    Memory layout:
+      emb_matrix : (num_keys, emb_dim)  float32  — shared across workers
+      ev_arr[s]  : (L_s,)               int32    — event index per session
+      com_arr[s] : (L_s,)               int32    — component index per session
+      ts_arr[s]  : (L_s,)               float32  — timestamps per session
+      index      : (N, 2)               int32    — (session_id, window_start)
+      lbl_arr    : (N,)                 int32    — label per window
     """
 
     def __init__(self, sessions, mapping, emb, cop, emb_dim, num_keys, window_size):
-        print('[dataset] Pre-computing all windows into contiguous arrays …')
+        print('[dataset] Building lazy index (no large pre-allocation) …')
         ws = window_size
 
-        # Embedding lookup matrix
+        # Embedding lookup matrix — (num_keys, emb_dim): typically only ~30 MB
         emb_matrix = np.zeros((num_keys, emb_dim), dtype=np.float32)
         for ev, idx in mapping.items():
             if ev in emb:
                 emb_matrix[idx] = emb[ev]
+        self.emb_matrix = emb_matrix  # shared across DataLoader workers (fork)
+        self.num_keys   = num_keys
+        self.ws         = ws
 
-        # Convert sessions once
-        proc_sessions = []
-        for seqs in sessions:
-            proc = []
-            for ev, component, ts in seqs:
-                proc.append((
-                    mapping.get(ev),
-                    cop.get(component, 0),
-                    _parse_ts_float(ts),
-                ))
-            proc_sessions.append(proc)
+        # Compact per-session arrays
+        self._ev  = []
+        self._com = []
+        self._ts  = []
 
-        # Count valid windows first (avoid repeated realloc)
-        total = sum(
-            1
-            for s in proc_sessions
-            for i in range(len(s) - ws)
-            if s[i + ws][0] is not None
-        )
-        print(f'[dataset] Total valid windows: {total:,}')
+        index_rows = []   # list of (session_id, window_start)
+        lbl_list   = []
 
-        # Pre-allocate
-        seq_arr = np.empty((total, ws, emb_dim), dtype=np.float32)
-        com_arr = np.empty((total, ws),          dtype=np.int32)
-        qp_arr  = np.empty((total, num_keys),    dtype=np.float32)
-        tm_arr  = np.empty((total, ws),          dtype=np.float32)
-        lbl_arr = np.empty((total,),             dtype=np.int64)
-
-        idx = 0
-        for seqs in proc_sessions:
+        for sid, seqs in enumerate(sessions):
             n = len(seqs)
-            ev_idxs_full = np.array(
-                [e[0] if e[0] is not None else 0 for e in seqs], dtype=np.int32)
-            com_full     = np.array([e[1] for e in seqs], dtype=np.int32)
-            ts_full      = np.array([e[2] for e in seqs], dtype=np.float64)
+            ev_idxs = np.array(
+                [mapping.get(ev) if mapping.get(ev) is not None else 0
+                 for ev, _, _ in seqs], dtype=np.int32)
+            com_idxs = np.array(
+                [cop.get(comp, 0) for _, comp, _ in seqs], dtype=np.int32)
+            ts_vals  = np.array(
+                [_parse_ts_float(ts) for _, _, ts in seqs], dtype=np.float32)
+
+            self._ev.append(ev_idxs)
+            self._com.append(com_idxs)
+            self._ts.append(ts_vals)
 
             for i in range(n - ws):
-                if seqs[i + ws][0] is None:
+                lbl_idx = mapping.get(seqs[i + ws][0])
+                if lbl_idx is None:
                     continue
-                ev_win = ev_idxs_full[i: i + ws]        # shape (W,)
+                index_rows.append((sid, i))
+                lbl_list.append(lbl_idx)
 
-                seq_arr[idx] = emb_matrix[ev_win]        # (W, emb_dim)
-                com_arr[idx] = com_full[i: i + ws]
-                tm_arr[idx]  = ts_full[i: i + ws] - ts_full[i]  # relative seconds
-                # vectorised bincount
-                qp_arr[idx]  = np.bincount(ev_win, minlength=num_keys).astype(np.float32)
-                lbl_arr[idx] = seqs[i + ws][0]
-                idx += 1
-
-        # Convert to torch tensors (shared memory, no copy)
-        self.seq  = torch.from_numpy(seq_arr)
-        self.com  = torch.from_numpy(com_arr).long()
-        self.qp   = torch.from_numpy(qp_arr)
-        self.tm   = torch.from_numpy(tm_arr)
-        self.lbl  = torch.from_numpy(lbl_arr)
-        print('[dataset] Pre-computation done.')
+        self.index   = np.array(index_rows, dtype=np.int32)  # (N, 2)
+        self.lbl_arr = np.array(lbl_list,   dtype=np.int64)
+        print(f'[dataset] Lazy index built: {len(self.lbl_arr):,} windows across '
+              f'{len(self._ev):,} sessions.')
 
     def __len__(self):
-        return len(self.lbl)
+        return len(self.lbl_arr)
 
     def __getitem__(self, idx):
-        # Pure tensor slices — no Python computation, DataLoader workers safe
-        return self.seq[idx], self.com[idx], self.qp[idx], self.tm[idx], self.lbl[idx]
+        sid, start = int(self.index[idx, 0]), int(self.index[idx, 1])
+        ws  = self.ws
+        ev  = self._ev[sid][start: start + ws]           # (W,)  int32
+        com = self._com[sid][start: start + ws]           # (W,)  int32
+        ts  = self._ts[sid][start: start + ws]            # (W,)  float32
+
+        seq  = self.emb_matrix[ev]                        # (W, emb_dim)
+        tm   = (ts - ts[0]).astype(np.float32)            # relative seconds
+        qp   = np.bincount(ev.astype(np.intp),
+                           minlength=self.num_keys).astype(np.float32)
+        lbl  = self.lbl_arr[idx]
+
+        return (torch.from_numpy(seq),
+                torch.from_numpy(com).long(),
+                torch.from_numpy(qp),
+                torch.from_numpy(tm),
+                torch.tensor(lbl, dtype=torch.long))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
