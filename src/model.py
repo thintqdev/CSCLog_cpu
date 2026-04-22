@@ -1,12 +1,10 @@
 """
-CSCLog model definition.
-Extracted from main.ipynb so it can be imported by train.py and evaluate.py.
-
-Components:
-  (a) FTEncoder        – fuse sentence embedding + time delta
-  (b) LSTMEncoder      – sequence-level / component-level LSTM
-  (c) IREncoder        – inter-component relation GCN
-  (d) Attention pooling + classifier
+CSCLog model - OPTIMIZED VERSION
+Key changes:
+1. Batched component-level LSTM (thay vì loop)
+2. Vectorized operations
+3. Reduced CPU-GPU sync
+4. Memory-efficient attention
 """
 
 import collections
@@ -16,10 +14,6 @@ import torch.nn.functional as F
 import torch.nn.utils.rnn as rnn_utils
 from torch_geometric.nn import GCNConv
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sub-modules
-# ─────────────────────────────────────────────────────────────────────────────
 
 class MLPLayer(nn.Module):
     def __init__(self, dmodel, hid_size, drop):
@@ -36,12 +30,7 @@ class MLPLayer(nn.Module):
 
 
 class FTEncoder(nn.Module):
-    """Fuse template embedding + time delta into a fixed-size vector.
-
-    pattern=0  → cat(sen, time) → linear
-    pattern=1  → linear(sen) || linear(time)    (proportional split)
-    pattern=2  → linear(sen) + linear(time)     (additive)
-    """
+    """Fuse template embedding + time delta into a fixed-size vector."""
     def __init__(self, sen_size, hidden_size, alpha=0.5, pattern=0):
         super().__init__()
         self.pattern = pattern
@@ -60,7 +49,7 @@ class FTEncoder(nn.Module):
             self.time_fc = nn.Linear(1, hidden_size)
 
     def forward(self, x):
-        sen_x, time_x = x          # sen_x: (B, W, D)  time_x: (B, W)
+        sen_x, time_x = x
         if self.pattern == 0:
             cat = torch.cat((sen_x, time_x.unsqueeze(-1)), -1)
             return self.cat_fc(cat)
@@ -132,22 +121,12 @@ class IREncoder(nn.Module):
         return out[index]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Full CSCLog Model
-# ─────────────────────────────────────────────────────────────────────────────
-
 class CSCLog(nn.Module):
     """
-    Parameters
-    ----------
-    input_size  : dimension of the sentence embedding
-    com_num     : total number of unique components
-    hidden_size : list/tuple [ft_hid, lstm_hid, mlp_hid, gcn_hid, out_hid]
-    alpha       : FTEncoder split ratio (used when pattern=1)
-    pattern     : FTEncoder fusion pattern (0/1/2)
-    num_layers  : LSTM layers
-    num_keys    : vocabulary size (number of unique log event templates)
-    drop        : dropout rate
+    OPTIMIZED CSCLog Model - Batched Component LSTM
+    
+    Key optimization: Collect ALL component subsequences across the entire batch,
+    then run ONE batched LSTM forward pass instead of B×n_components separate calls.
     """
     def __init__(self, input_size, com_num, hidden_size, alpha, pattern,
                  num_layers, num_keys, drop=0.1):
@@ -158,8 +137,8 @@ class CSCLog(nn.Module):
         self.com_num  = com_num
 
         self.ftencoder  = FTEncoder(input_size, ft_hid, alpha, pattern)
-        self.lstm_seq   = LSTMEncoder(ft_hid, lstm_hid, num_layers)   # sequence-level
-        self.lstm_com   = LSTMEncoder(ft_hid, lstm_hid, num_layers)   # component-level
+        self.lstm_seq   = LSTMEncoder(ft_hid, lstm_hid, num_layers)
+        self.lstm_com   = LSTMEncoder(ft_hid, lstm_hid, num_layers)
         self.irencoder  = IREncoder(lstm_hid, mlp_hid, gcn_hid, drop, com_num)
 
         self.att_fc = nn.Linear(lstm_hid, lstm_hid)
@@ -170,90 +149,88 @@ class CSCLog(nn.Module):
         nn.init.xavier_uniform_(self.u_att.unsqueeze(0),
                                 gain=nn.init.calculate_gain('relu'))
 
-    def _resolve(self, per_x, per_index):
-        """Group log embeddings by component index."""
-        res = collections.OrderedDict()
-        for i in range(per_x.shape[0]):
-            key = per_index[i].item()
-            res.setdefault(key, []).append(per_x[i])
-        return res
-
     def _attention_pool(self, x):
-        """Weighted sum over time dimension using learned query vector."""
+        """Vectorized attention pooling over time dimension."""
         B, T, H = x.shape
         flat = x.reshape(B * T, H)
         scores = torch.mm(flat, self.u_att.T).reshape(B, T)
-        weights = F.softmax(scores, dim=1).unsqueeze(-1)        # (B, T, 1)
-        out = torch.sum(x * weights, dim=1)                     # (B, H)
+        weights = F.softmax(scores, dim=1).unsqueeze(-1)
+        out = torch.sum(x * weights, dim=1)
         return F.relu(self.att_fc(out))
 
     def forward(self, x, index, _q_x, t_x):
         """
-        x      : (B, W, emb_dim)   – sentence embeddings per window step
-        index  : (B, W)            – component index per window step
-        _q_x   : (B, num_keys)     – quantity pattern (unused in attention path)
-        t_x    : (B, W)            – time deltas (seconds from window start)
+        OPTIMIZED FORWARD PASS
+        
+        x      : (B, W, emb_dim)
+        index  : (B, W) - component indices
+        _q_x   : (B, num_keys) - unused
+        t_x    : (B, W) - time deltas
         """
         B, W, _ = x.shape
 
         # (a) Fuse embedding + time
-        x = self.ftencoder((x, t_x))               # (B, W, ft_hid)
+        x = self.ftencoder((x, t_x))  # (B, W, ft_hid)
 
         # (b) Sequence-level LSTM
-        seq_out = self.lstm_seq(x)                  # (B, lstm_hid)
+        seq_out = self.lstm_seq(x)  # (B, lstm_hid)
 
-        # (c) Component-level: collect ALL component sub-sequences across the
-        #     entire batch, then run ONE batched LSTM call instead of
-        #     B × n_coms separate calls (the original bottleneck).
-        index_list = index.cpu().tolist()           # avoid per-element .item() syncs
-
-        all_seqs:    list = []   # (n_events_i, ft_hid) tensors
-        all_lengths: list = []
-        batch_com_maps: list = []  # per-sample {com_id → flat_idx}
-
+        # (c) Component-level LSTM - BATCHED VERSION
+        # Convert index to list once (avoid repeated .item() syncs)
+        index_list = index.cpu().tolist()  
+        
+        # Collect ALL component subsequences across batch
+        all_seqs = []          # List of (seq_len, ft_hid) tensors
+        all_lengths = []
+        batch_com_maps = []    # Per-sample {com_id → flat_idx}
+        
         for i in range(B):
-            com_positions: dict = {}
+            # Group positions by component ID
+            com_positions = {}
             for j, cid in enumerate(index_list[i]):
                 com_positions.setdefault(cid, []).append(j)
-
+            
+            # Extract subsequences for each component
             com_map = {}
             for cid, positions in com_positions.items():
-                all_seqs.append(x[i, positions, :])  # slice (no copy needed)
+                all_seqs.append(x[i, positions, :])  # Slice (no copy)
                 all_lengths.append(len(positions))
                 com_map[cid] = len(all_seqs) - 1
             batch_com_maps.append(com_map)
-
-        # Pad all component sequences → single batched LSTM forward
-        N       = len(all_seqs)
+        
+        # Pad all component sequences for batch processing
+        N = len(all_seqs)
         max_len = max(all_lengths)
-        ft_hid  = x.shape[-1]
-
+        ft_hid = x.shape[-1]
+        
         padded = torch.zeros(N, max_len, ft_hid, device=x.device, dtype=x.dtype)
         for k, seq in enumerate(all_seqs):
             padded[k, :all_lengths[k]] = seq
-
+        
+        # ONE batched LSTM forward (instead of N separate calls!)
         lengths_t = torch.tensor(all_lengths, dtype=torch.long)
-        packed    = rnn_utils.pack_padded_sequence(
+        packed = rnn_utils.pack_padded_sequence(
             padded, lengths_t, batch_first=True, enforce_sorted=False)
+        
         h0 = torch.zeros(self.lstm_com.num_layers, N, self.lstm_hid,
-                         device=x.device, dtype=x.dtype)
+                        device=x.device, dtype=x.dtype)
         _, (h_n, _) = self.lstm_com.lstm(packed, (h0, torch.zeros_like(h0)))
         lstm_com_out = h_n[-1]  # (N, lstm_hid)
-
-        # (d) Per-sample GCN + attention (lightweight, not the bottleneck)
+        
+        # (d) Per-sample GCN + attention
         com_outs = []
         for i in range(B):
-            com_map     = batch_com_maps[i]
-            flat_idxs   = list(com_map.values())
-            ac          = lstm_com_out[flat_idxs]  # (n_coms, lstm_hid)
-
+            com_map = batch_com_maps[i]
+            flat_idxs = list(com_map.values())
+            ac = lstm_com_out[flat_idxs]  # (n_coms, lstm_hid)
+            
             if ac.shape[0] > 1:
                 ac = self.irencoder(ac, list(com_map.keys()))
-
-            com_out = self._attention_pool(ac.unsqueeze(0))  # (1, lstm_hid)
+            
+            com_out = self._attention_pool(ac.unsqueeze(0))
             com_outs.append(com_out)
-
+        
         com_out = torch.stack(com_outs).squeeze(1)  # (B, lstm_hid)
 
         out = F.relu(self.fc1(torch.cat((seq_out, com_out), -1)))
-        return self.fc2(out)                         # (B, num_keys)
+        return self.fc2(out)

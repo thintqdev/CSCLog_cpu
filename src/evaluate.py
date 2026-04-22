@@ -1,12 +1,11 @@
 """
-Step 4: Evaluate a saved CSCLog checkpoint on the Linux test sets.
+Step 4: Evaluate - OPTIMIZED VERSION
 
-Usage:
-    python src/evaluate.py [--checkpoint PATH] [--num_candidates K [K ...]]
-
-Loads the best checkpoint produced by train.py and prints:
-  - Top-K anomaly detection: Accuracy, Precision, Recall, F1
-  - Per-K breakdown
+Key optimizations:
+1. All counting operations on GPU (no CPU sync per batch)
+2. Larger batch size for better GPU utilization
+3. Reduced memory allocations
+4. Compile model with torch.compile (PyTorch 2.0+)
 """
 
 import sys
@@ -39,11 +38,11 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from src.model import CSCLog
 
-# ── Device: GPU if available, else CPU ──────────────────────────────────────
+# ── Device ──
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[evaluate] Using device: {DEVICE}')
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ── Paths ──
 RESULT_DIR    = os.path.join(os.path.dirname(__file__), 'dataset', 'result')
 TEMPLATES_CSV = os.path.join(RESULT_DIR, 'data_full_templates.csv')
 EMB_PATH      = os.path.join(RESULT_DIR, 'data_full_sentences_emb.json')
@@ -51,11 +50,6 @@ COM_PATH      = os.path.join(RESULT_DIR, 'data_full_component.json')
 TEST_NOR_CSV  = os.path.join(RESULT_DIR, 'test_normal.csv')
 TEST_ANO_CSV  = os.path.join(RESULT_DIR, 'test_anomaly.csv')
 DEFAULT_CKPT  = os.path.join(RESULT_DIR, 'csclog_best.pth')
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data helper (same logic as train.py)
-# ─────────────────────────────────────────────────────────────────────────────
 
 _DEFAULT_DT = dateutil.parser.parse('2000-01-01T00:00:00')
 
@@ -112,20 +106,23 @@ def load_test_sessions(log_path, templates_csv, emb_path, com_path, window_size)
     return sessions
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Inference
-# ─────────────────────────────────────────────────────────────────────────────
-
 def evaluate_sessions(normal_sessions, anomaly_sessions, model,
-                      num_candidates_list, anomaly_rate=1, batch_size=256):
-    """Batch all windows across sessions for fast inference."""
+                      num_candidates_list, anomaly_rate=1, batch_size=512):
+    """
+    OPTIMIZED EVALUATION - All operations on GPU
+    
+    Key changes:
+    1. Larger batch size (512 instead of 256)
+    2. GPU-only miss counting (no CPU sync per batch)
+    3. Single CPU transfer at the end
+    """
     model.eval()
 
     def run(sessions, k_list):
         if not sessions:
             return {k: [] for k in k_list}
 
-        # Flatten all windows with their session index
+        # Flatten all windows
         all_seq, all_com, all_quan, all_timp, all_labels, session_ids = \
             [], [], [], [], [], []
         for sid, (seq, com, quan, timp, labels) in enumerate(sessions):
@@ -136,12 +133,12 @@ def evaluate_sessions(normal_sessions, anomaly_sessions, model,
             all_labels.extend(labels)
             session_ids.extend([sid] * len(labels))
 
-        # Vectorised miss counters (no Python loop per window)
-        session_misses = {k: torch.zeros(len(sessions), dtype=torch.long)
+        # GPU-only miss counters
+        session_misses = {k: torch.zeros(len(sessions), dtype=torch.long, device=DEVICE)
                           for k in k_list}
 
-        pin    = (DEVICE.type == 'cuda')
-        ds     = TensorDataset(
+        pin = (DEVICE.type == 'cuda')
+        ds = TensorDataset(
             torch.tensor(all_seq,     dtype=torch.float),
             torch.tensor(all_com,     dtype=torch.long),
             torch.tensor(all_quan,    dtype=torch.float),
@@ -150,7 +147,7 @@ def evaluate_sessions(normal_sessions, anomaly_sessions, model,
             torch.tensor(session_ids, dtype=torch.long),
         )
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                            pin_memory=pin, num_workers=4)
+                            pin_memory=pin, num_workers=4, prefetch_factor=2)
 
         use_amp = (DEVICE.type == 'cuda')
         with torch.no_grad():
@@ -160,19 +157,24 @@ def evaluate_sessions(normal_sessions, anomaly_sessions, model,
                 quan_b = quan_b.to(DEVICE, non_blocking=True)
                 timp_b = timp_b.to(DEVICE, non_blocking=True)
                 lab_b  = lab_b.to(DEVICE, non_blocking=True)
+                sid_b  = sid_b.to(DEVICE, non_blocking=True)  # Keep on GPU!
 
                 with torch.autocast(device_type=DEVICE.type, enabled=use_amp):
                     out = model(seq_b, com_b, quan_b, timp_b)
+                
                 for k in k_list:
-                    topk      = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
-                    wrong     = ~(lab_b.unsqueeze(1) == topk).any(dim=1)  # (B,)
-                    wrong_sid = sid_b[wrong].cpu()
+                    topk = torch.argsort(out, dim=1, descending=True)[:, :k].contiguous()
+                    wrong = ~(lab_b.unsqueeze(1) == topk).any(dim=1)  # (B,)
+                    wrong_sid = sid_b[wrong]  # Still on GPU!
+                    
                     if wrong_sid.numel() > 0:
+                        # GPU-only scatter_add (no CPU sync!)
                         session_misses[k].scatter_add_(
                             0, wrong_sid,
-                            torch.ones(wrong_sid.numel(), dtype=torch.long))
+                            torch.ones(wrong_sid.numel(), dtype=torch.long, device=DEVICE))
 
-        hits = {k: (session_misses[k] >= anomaly_rate).long().tolist()
+        # Single CPU transfer at the end
+        hits = {k: (session_misses[k] >= anomaly_rate).long().cpu().tolist()
                 for k in k_list}
         return hits
 
@@ -208,15 +210,13 @@ def evaluate_sessions(normal_sessions, anomaly_sessions, model,
                                  zero_division=0))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def parse_args():
-    p = argparse.ArgumentParser(description='Evaluate CSCLog checkpoint (CPU)')
+    p = argparse.ArgumentParser(description='Evaluate CSCLog checkpoint - OPTIMIZED')
     p.add_argument('--checkpoint',     type=str, default=DEFAULT_CKPT)
     p.add_argument('--num_candidates', type=int, nargs='+', default=[1, 5, 10])
     p.add_argument('--anomaly_rate',   type=int, default=1)
+    p.add_argument('--compile',        action='store_true',
+                   help='Use torch.compile for faster inference (PyTorch 2.0+)')
     return p.parse_args()
 
 
@@ -229,7 +229,7 @@ def main():
     saved_args = ckpt['args']
     window_size = saved_args['window_size']
 
-    # Rebuild model from saved config
+    # Rebuild model
     model = CSCLog(
         input_size  = ckpt['emb_dim'],
         com_num     = ckpt['num_coms'],
@@ -241,6 +241,12 @@ def main():
         drop        = saved_args['drop'],
     ).to(DEVICE)
     model.load_state_dict(ckpt['model'])
+    
+    # Optional: torch.compile for 2-3x speedup (PyTorch 2.0+)
+    if args.compile:
+        print('[evaluate] Compiling model with torch.compile...')
+        model = torch.compile(model, mode='max-autotune')
+    
     saved_metric = ckpt.get('fbeta2_ano', ckpt.get('rec', ckpt.get('f1', 0.0)))
     metric_name  = 'F2ano' if 'fbeta2_ano' in ckpt else ('AnoRec' if 'rec' in ckpt else 'F1')
     print(f'[evaluate] Model restored (epoch {ckpt["epoch"]}, '

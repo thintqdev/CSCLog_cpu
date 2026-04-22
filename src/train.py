@@ -118,22 +118,37 @@ def _safe_eval(s):
 class _TrainDataset(torch.utils.data.Dataset):
     """Memory-efficient sliding-window dataset.
 
-    Keeps raw session lists in memory and encodes each window to tensors
-    on-the-fly inside __getitem__, so only one batch worth of data is
-    ever materialised at a time.
+    Pre-computes timestamps as float seconds and builds a numpy embedding
+    matrix at __init__ time (once per run) so __getitem__ only does fast
+    numpy row-fetch — no dateutil / dict lookup per step per epoch.
     """
 
     def __init__(self, sessions, mapping, emb, cop, emb_dim, num_keys, window_size):
-        self.emb      = emb
-        self.cop      = cop
-        self.mapping  = mapping
-        self.emb_dim  = emb_dim
-        self.num_keys = num_keys
         self.ws       = window_size
-        # Build a flat index of (session_events_list, start_offset) pairs.
-        # Skip windows whose target EventId is None (unknown after NaN substitution).
-        self.index: list = []
+        self.num_keys = num_keys
+
+        # Embedding matrix: emb_matrix[i] = embedding vector for event index i
+        emb_np = np.zeros((num_keys, emb_dim), dtype=np.float32)
+        for ev, idx in mapping.items():
+            if ev in emb:
+                emb_np[idx] = emb[ev]
+        self.emb_matrix = emb_np                    # shared read-only across workers
+
+        # Pre-convert sessions: (ev_idx | None, com_idx, ts_float_seconds)
+        # dateutil called once here instead of ws × N_items × epochs times.
+        proc_sessions = []
         for seqs in sessions:
+            proc = []
+            for ev, component, ts in seqs:
+                proc.append((
+                    mapping.get(ev),                # None if unmapped
+                    cop.get(component, 0),
+                    _parse_ts(ts).timestamp(),      # float Unix seconds
+                ))
+            proc_sessions.append(proc)
+
+        self.index: list = []
+        for seqs in proc_sessions:
             n = len(seqs)
             for i in range(n - window_size):
                 if seqs[i + window_size][0] is not None:
@@ -144,27 +159,27 @@ class _TrainDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         seqs, i = self.index[idx]
-        window  = seqs[i: i + self.ws]
-        label   = self.mapping.get(seqs[i + self.ws][0], 0)
+        ws      = self.ws
+        window  = seqs[i: i + ws]
 
-        qp = [0] * self.num_keys
-        for ev, _, _ in window:
-            if ev in self.mapping:
-                qp[self.mapping[ev]] += 1
+        ev_idxs  = [e[0] if e[0] is not None else 0 for e in window]
+        com_idxs = [e[1] for e in window]
+        t0       = window[0][2]
+        tm       = [e[2] - t0 for e in window]
+        label    = seqs[i + ws][0]                  # guaranteed not None by index filter
 
-        inp, com, tm = [], [], []
-        t0 = _parse_ts(window[0][2])
-        for ev, component, ts in window:
-            inp.append(self.emb.get(ev, [0.0] * self.emb_dim))
-            com.append(self.cop.get(component, 0))
-            tm.append((_parse_ts(ts) - t0).seconds)
+        # Fast numpy matrix row-fetch (no dict lookup, no list-of-lists construction)
+        inp = self.emb_matrix[ev_idxs]              # (ws, emb_dim) float32, new array
+
+        # Vectorised quantity pattern
+        qp = np.bincount(ev_idxs, minlength=self.num_keys).astype(np.float32)
 
         return (
-            torch.tensor(inp,   dtype=torch.float),
-            torch.tensor(com,   dtype=torch.long),
-            torch.tensor(qp,    dtype=torch.float),
-            torch.tensor(tm,    dtype=torch.float),
-            torch.tensor(label, dtype=torch.long),
+            torch.from_numpy(inp),
+            torch.tensor(com_idxs, dtype=torch.long),
+            torch.from_numpy(qp),
+            torch.tensor(tm,       dtype=torch.float),
+            torch.tensor(label,    dtype=torch.long),
         )
 
 
