@@ -94,9 +94,9 @@ DEFAULTS = dict(
     batch_size        = SAFE_BATCH,
     grad_accum        = 2,
     epochs            = 25,
-    lr                = 2e-4,
+    lr                = 5e-5,       # Reduced from 2e-4 to prevent NaN
     warmup_epochs     = 2,
-    weight_decay      = 5e-4,
+    weight_decay      = 1e-4,       # Reduced weight decay too
     drop              = 0.2,
     hidden_size       = [128, 128, 128, 128, 128],
     alpha             = 0.8,
@@ -454,12 +454,10 @@ def train(args):
     steps_per_epoch = len(dataloader)
     scheduler = _make_scheduler(optimizer, args.warmup_epochs, args.epochs,
                                  steps_per_epoch)
-    optimizer.step()
-    scheduler.step()
-    optimizer.zero_grad(set_to_none=True)
 
     best_fbeta, best_epoch = 0.0, 0
     patience_counter = 0
+    global_step = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -490,20 +488,40 @@ def train(args):
                     loss = criterion(out, label) / args.grad_accum
 
                 if not torch.isfinite(loss):
-                    print(f'\n[train] WARNING: non-finite loss at step {acc_step}')
+                    print(f'\n[train] WARNING: non-finite loss at step {acc_step}, skipping batch')
                     print(f'  seq NaN={seq.isnan().any().item()} Inf={seq.isinf().any().item()}')
                     print(f'  out NaN={out.isnan().any().item()} Inf={out.isinf().any().item()}')
                     print(f'  label min={label.min().item()} max={label.max().item()} num_keys={num_keys}')
+                    # Check model parameters for NaN
+                    for name, param in model.named_parameters():
+                        if param.isnan().any() or param.isinf().any():
+                            print(f'  CORRUPT PARAM: {name}')
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
                 loss.backward()
 
                 if (acc_step + 1) % args.grad_accum == 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # Clip gradients BEFORE checking for NaN (prevents explosion)
+                    total_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    # Check if gradients are finite after clipping
+                    grad_finite = True
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            if not torch.isfinite(param.grad).all():
+                                grad_finite = False
+                                break
+                    
+                    if not grad_finite:
+                        print(f'\n[train] WARNING: Non-finite gradients at step {acc_step}, skipping update')
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
 
                 epoch_loss += loss.item() * args.grad_accum
 
@@ -523,10 +541,12 @@ def train(args):
             else:
                 raise
 
+        # Handle leftover gradients at epoch end
         if steps_per_epoch % args.grad_accum != 0:
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+            total_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if torch.isfinite(torch.tensor(total_norm)):
+                optimizer.step()
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
         avg_loss = epoch_loss / steps_per_epoch

@@ -127,6 +127,26 @@ class CSCLog(nn.Module):
         self.u_att = nn.Parameter(torch.zeros(lstm_hid, 1))
         nn.init.xavier_uniform_(self.u_att.unsqueeze(0),
                                 gain=nn.init.calculate_gain('relu'))
+        
+        # Initialize all linear layers with smaller std to prevent NaN
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights with conservative scaling to prevent NaN."""
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                # Xavier/Glorot with gain=1.0 (conservative)
+                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.LSTM):
+                for param_name, param in module.named_parameters():
+                    if 'weight_ih' in param_name:
+                        nn.init.xavier_uniform_(param, gain=0.5)
+                    elif 'weight_hh' in param_name:
+                        nn.init.orthogonal_(param, gain=0.5)
+                    elif 'bias' in param_name:
+                        nn.init.constant_(param, 0.0)
 
     def _attention_pool(self, x: torch.Tensor) -> torch.Tensor:
         scores  = torch.bmm(x, self.u_att.unsqueeze(0).expand(x.size(0), -1, -1))
@@ -142,7 +162,19 @@ class CSCLog(nn.Module):
         index = index.clamp(0, self.com_num - 1)
 
         x = self.ftencoder(x, t_x)
+        
+        # Early NaN check
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f'[CSCLog] NaN/Inf detected after ftencoder')
+            print(f'  Input x stats: min={x.min():.4f} max={x.max():.4f} mean={x.mean():.4f}')
+            # Replace NaN/Inf with 0 to allow training to continue
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         seq_out = self.lstm_seq(x)
+        
+        if torch.isnan(seq_out).any() or torch.isinf(seq_out).any():
+            print(f'[CSCLog] NaN/Inf detected after lstm_seq')
+            seq_out = torch.nan_to_num(seq_out, nan=0.0, posinf=1e6, neginf=-1e6)
 
         index_cpu    = index.cpu().tolist()
         all_subseqs  = []
@@ -187,6 +219,17 @@ class CSCLog(nn.Module):
             com_outs.append(self._attention_pool(ac.unsqueeze(0)))
 
         com_out = torch.cat(com_outs, dim=0)
+        
+        if torch.isnan(com_out).any() or torch.isinf(com_out).any():
+            print(f'[CSCLog] NaN/Inf detected in com_out')
+            com_out = torch.nan_to_num(com_out, nan=0.0, posinf=1e6, neginf=-1e6)
 
         out = F.relu(self.fc1(torch.cat([seq_out, com_out], dim=-1)))
-        return self.fc2(out)
+        out = self.fc2(out)
+        
+        # Final safety check
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            print(f'[CSCLog] NaN/Inf in final output')
+            out = torch.nan_to_num(out, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        return out
